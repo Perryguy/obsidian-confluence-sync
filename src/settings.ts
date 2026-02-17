@@ -130,7 +130,9 @@ export class ConfluenceSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Space Key")
-      .setDesc("Confluence space key, e.g. ENG")
+      .setDesc("Space Key (not the space name). Example: ENG.\n" +
+  "Cloud URL: https://site.atlassian.net/wiki/spaces/ENG/pages/...\n" +
+  "Self-hosted URL: https://confluence.company.com/spaces/ENG/...")
       .addText((t: any) =>
         t.setValue(this.plugin.settings.spaceKey).onChange(async (v: string) => {
           this.plugin.settings.spaceKey = v.trim();

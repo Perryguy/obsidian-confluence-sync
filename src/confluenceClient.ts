@@ -1,4 +1,3 @@
-// src/confluenceClient.ts
 import { requestUrl, RequestUrlParam } from "obsidian";
 
 type HttpMethod = "GET" | "POST" | "PUT";
@@ -7,19 +6,22 @@ export type ConfluenceMode = "auto" | "cloud" | "selfHosted";
 export type ConfluenceAuthMode = "basic" | "bearer";
 
 export interface ConfluenceClientSettings {
-  baseUrl: string;                 // e.g. https://confluence.company.net OR https://site.atlassian.net/wiki
-  mode: ConfluenceMode;            // auto recommended
-  authMode: ConfluenceAuthMode;    // bearer or basic
-  username?: string;               // basic: cloud email or selfhost username
-  passwordOrToken?: string;        // basic: cloud api token or selfhost password/token
-  bearerToken?: string;            // bearer: PAT
-  restApiPathOverride?: string;    // optional override like "/confluence/rest/api" or "/wiki/rest/api"
+  baseUrl: string;
+  mode: ConfluenceMode;
+
+  authMode: ConfluenceAuthMode;
+  username: string;
+  passwordOrToken: string;
+  bearerToken: string;
+
+  restApiPathOverride: string;
 }
 
 export interface ConfluencePage {
   id: string;
   title: string;
   version: { number: number };
+  _links?: { webui?: string };
 }
 
 export class ConfluenceClient {
@@ -28,7 +30,7 @@ export class ConfluenceClient {
   constructor(private s: ConfluenceClientSettings) {}
 
   private base(): string {
-    return this.s.baseUrl.replace(/\/+$/, "");
+    return (this.s.baseUrl || "").replace(/\/+$/, "");
   }
 
   private authHeaders(): Record<string, string> {
@@ -36,7 +38,7 @@ export class ConfluenceClient {
       if (!this.s.bearerToken) throw new Error("Bearer token missing.");
       return { Authorization: `Bearer ${this.s.bearerToken}` };
     }
-    // basic
+
     if (!this.s.username || !this.s.passwordOrToken) throw new Error("Username/password-or-token missing.");
     const basic = btoa(`${this.s.username}:${this.s.passwordOrToken}`);
     return { Authorization: `Basic ${basic}` };
@@ -44,52 +46,49 @@ export class ConfluenceClient {
 
   private candidateRestRoots(): string[] {
     const base = this.base();
+    if (!base) return [];
 
-    // If user overrides, trust it first.
+    // Explicit override wins
     if (this.s.restApiPathOverride?.trim()) {
       const p = this.s.restApiPathOverride.startsWith("/")
         ? this.s.restApiPathOverride
         : `/${this.s.restApiPathOverride}`;
-      return [`${base}${p}`];
+      return [(`${base}${p}`).replace(/\/+$/, "")];
     }
 
-    // Detect "cloud-ish" by domain and/or explicit mode.
     const looksCloud = base.includes("atlassian.net");
     const mode = this.s.mode;
 
     const roots: string[] = [];
-
     const add = (suffix: string) => roots.push(`${base}${suffix}`);
 
     if (mode === "cloud" || (mode === "auto" && looksCloud)) {
-      // Cloud commonly uses /wiki/rest/api
+      // If base already includes /wiki, it should be .../wiki/rest/api
       if (base.endsWith("/wiki")) add("/rest/api");
       else add("/wiki/rest/api");
+
       add("/rest/api"); // fallback
-      return dedupe(roots);
+      return Array.from(new Set(roots.map(r => r.replace(/\/+$/, ""))));
     }
 
-    // Self-hosted default
+    // self-hosted default
     add("/rest/api");
-    add("/wiki/rest/api"); // fallback if their reverse proxy exposes /wiki
-    return dedupe(roots);
-
-    function dedupe(arr: string[]) {
-      return Array.from(new Set(arr.map(x => x.replace(/\/+$/, ""))));
-    }
+    add("/wiki/rest/api"); // fallback in case of reverse proxy mapping
+    return Array.from(new Set(roots.map(r => r.replace(/\/+$/, ""))));
   }
 
   private async ensureRestRoot(): Promise<string> {
     if (this.restRoot) return this.restRoot;
 
     const candidates = this.candidateRestRoots();
+    if (candidates.length === 0) throw new Error("Base URL is empty.");
 
-    // probe each candidate using a lightweight endpoint
     const errors: string[] = [];
 
     for (const root of candidates) {
       try {
-        await this.rawCall<any>("GET", `${root}/space?limit=1`, undefined, true);
+        // Lightweight probe:
+        await this.rawCall("GET", `${root}/space?limit=1`, undefined, true);
         this.restRoot = root;
         return root;
       } catch (e: any) {
@@ -98,9 +97,9 @@ export class ConfluenceClient {
     }
 
     throw new Error(
-      `Could not detect Confluence REST API root. Tried:\n` +
-      errors.map(x => `- ${x}`).join("\n") +
-      `\n\nIf you are self-hosted behind a context path (e.g. /confluence), set REST API path override to something like "/confluence/rest/api".`
+      `Could not detect Confluence REST API root.\nTried:\n${errors.map(e => `- ${e}`).join("\n")}\n\n` +
+        `If your Confluence is behind a context path (e.g. https://host/confluence), set Base URL to include it ` +
+        `or set REST API path override to something like "/confluence/rest/api".`
     );
   }
 
@@ -115,7 +114,7 @@ export class ConfluenceClient {
       method,
       headers: {
         ...this.authHeaders(),
-        "Accept": "application/json",
+        Accept: "application/json",
         ...(body ? { "Content-Type": "application/json" } : {})
       },
       body: body ? JSON.stringify(body) : undefined
@@ -128,11 +127,8 @@ export class ConfluenceClient {
 
   private async call<T>(method: HttpMethod, path: string, body?: any): Promise<T> {
     const root = await this.ensureRestRoot();
-    const url = `${root}${path}`;
-    return this.rawCall<T>(method, url, body);
+    return this.rawCall<T>(method, `${root}${path}`, body);
   }
-
-  // ---- Public API ----
 
   async ping(): Promise<string> {
     const root = await this.ensureRestRoot();
@@ -140,6 +136,7 @@ export class ConfluenceClient {
   }
 
   async searchPageByTitle(spaceKey: string, title: string): Promise<ConfluencePage | null> {
+    // Exact title match via CQL
     const cql = `type=page AND space="${spaceKey}" AND title="${title.replace(/"/g, '\\"')}"`;
     const result = await this.call<{ results: ConfluencePage[] }>(
       "GET",
@@ -160,6 +157,7 @@ export class ConfluenceClient {
       body: { storage: { value: storageValue, representation: "storage" } }
     };
     if (parentId) body.ancestors = [{ id: parentId }];
+
     return this.call<ConfluencePage>("POST", `/content`, body);
   }
 
