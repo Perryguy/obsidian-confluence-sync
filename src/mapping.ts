@@ -3,13 +3,16 @@ import type { MappingStore, MappingEntry } from "./types";
 
 const DEFAULT_MAPPING: MappingStore = {
   version: 1,
-  entries: {}
+  entries: {},
 };
 
 export class MappingService {
   private store: MappingStore = { ...DEFAULT_MAPPING };
 
-  constructor(private app: App, private mappingFileName: string) {}
+  constructor(
+    private app: App,
+    private mappingFileName: string,
+  ) {}
 
   getStore(): MappingStore {
     return this.store;
@@ -28,7 +31,10 @@ export class MappingService {
     const af = this.app.vault.getAbstractFileByPath(path);
 
     if (!af) {
-      await this.app.vault.create(path, JSON.stringify(DEFAULT_MAPPING, null, 2));
+      await this.app.vault.create(
+        path,
+        JSON.stringify(DEFAULT_MAPPING, null, 2),
+      );
       this.store = { ...DEFAULT_MAPPING };
       return;
     }
@@ -57,5 +63,14 @@ export class MappingService {
     }
 
     await this.app.vault.modify(af as TFile, payload);
+  }
+
+  async reset(): Promise<void> {
+    this.store = { version: 1, entries: {} };
+    await this.save();
+  }
+
+  remove(filePath: string): void {
+    delete this.store.entries[filePath];
   }
 }
