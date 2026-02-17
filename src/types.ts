@@ -23,6 +23,10 @@ export interface ConfluenceSettings {
   storeContentProperties: boolean;
 
   mappingFileName: string; // e.g. confluence-mapping.json
+
+  dryRun: boolean;
+  childPagesUnderRoot: boolean;
+  showProgressNotices: boolean;
 }
 
 export interface MappingEntry {

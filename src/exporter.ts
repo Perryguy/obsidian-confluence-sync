@@ -4,6 +4,8 @@ import type { ConfluenceClient } from "./confluenceClient";
 import { SimpleConfluenceConverter } from "./simpleConverter";
 import type { MappingService } from "./mapping";
 
+export type ProgressFn = (text: string) => void;
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -28,37 +30,89 @@ export class Exporter {
     private settings: ConfluenceSettings,
     private client: ConfluenceClient,
     private mapping: MappingService,
+    private progress: ProgressFn,
   ) {}
 
   async exportFromRoot(root: TFile): Promise<void> {
     await this.mapping.load();
 
     const files = await this.buildExportSet(root);
-    if (files.length === 0) {
+    const ordered = this.orderRootFirst(root, files);
+
+    if (ordered.length === 0) {
       new Notice("Nothing to export.");
       return;
     }
 
-    new Notice(`Confluence: exporting ${files.length} note(s)…`);
-
-    // Pass 1: ensure all pages exist + mapping is populated
-    for (const f of files) {
-      await this.ensurePageForFile(f);
-      await this.mapping.save();
+    if (this.settings.dryRun) {
+      this.progress(
+        `Confluence: DRY RUN — would export ${ordered.length} note(s)`,
+      );
+      if (this.settings.showProgressNotices)
+        new Notice(`Dry run: would export ${ordered.length} note(s)`);
+    } else {
+      this.progress(`Confluence: exporting ${ordered.length} note(s)…`);
+      if (this.settings.showProgressNotices)
+        new Notice(`Confluence: exporting ${ordered.length} note(s)…`);
     }
 
-    // Pass 2: rewrite internal wikilinks and update content
-    for (const f of files) {
+    // Pass 1: ensure root exists first (so we can parent children under it)
+    this.progress(`Confluence: Pass 1/2 (root) ${root.basename}`);
+    await this.ensurePageForFile(root, undefined);
+    await this.mapping.save();
+
+    const rootEntry = this.mapping.get(root.path);
+    const rootPageId = rootEntry?.pageId;
+
+    // Parent override for non-root pages if enabled and root exists
+    const parentOverride =
+      this.settings.childPagesUnderRoot && rootPageId
+        ? rootPageId
+        : this.settings.parentPageId || undefined;
+
+    // Pass 1: remaining pages
+    let idx = 0;
+    const totalOthers = Math.max(0, ordered.length - 1);
+
+    for (const f of ordered) {
+      if (f.path === root.path) continue;
+      idx++;
+
+      this.progress(
+        `Confluence: Pass 1/2 (${idx}/${totalOthers}) ${f.basename}`,
+      );
+      await this.ensurePageForFile(f, parentOverride);
+
+      // Save mapping periodically (safer)
+      if (idx % 5 === 0) await this.mapping.save();
+    }
+
+    await this.mapping.save();
+
+    // Dry run ends here (don’t attempt link rewrite)
+    if (this.settings.dryRun) {
+      this.progress(`Confluence: DRY RUN complete (${ordered.length} notes)`);
+      if (this.settings.showProgressNotices) new Notice("Dry run complete.");
+      return;
+    }
+
+    // Pass 2: rewrite links + update content
+    let j = 0;
+    const total = ordered.length;
+
+    for (const f of ordered) {
+      j++;
+      this.progress(`Confluence: Pass 2/2 (${j}/${total}) ${f.basename}`);
       await this.updatePageContentWithLinks(f);
     }
 
     await this.mapping.save();
-    new Notice("Confluence export complete.");
+    this.progress("Confluence: export complete");
+    if (this.settings.showProgressNotices)
+      new Notice("Confluence export complete.");
   }
 
-  // -------------------------
   // Export set discovery
-  // -------------------------
   private async buildExportSet(root: TFile): Promise<TFile[]> {
     const mode = this.settings.exportMode;
 
@@ -148,7 +202,10 @@ export class Exporter {
   }
 
   // Pass 1: ensure page exists
-  private async ensurePageForFile(file: TFile): Promise<void> {
+  private async ensurePageForFile(
+    file: TFile,
+    parentIdOverride?: string,
+  ): Promise<void> {
     const title = basenameTitle(file);
     const md = await this.app.vault.read(file);
 
@@ -159,6 +216,14 @@ export class Exporter {
 
     // Prefer mapping
     if (mapped?.pageId && this.settings.updateExisting) {
+
+      if (this.settings.dryRun) {
+        console.log(
+          `[DryRun] would update mapped page "${title}" id=${mapped.pageId}`,
+        );
+        return;
+      }
+      
       try {
         const updated = await this.client.updatePage(
           mapped.pageId,
@@ -194,6 +259,14 @@ export class Exporter {
       this.settings.spaceKey,
       title,
     );
+
+    if (this.settings.dryRun) {
+      console.log(
+        `[DryRun] would update found-by-title page "${title}" id=${found?.id}`,
+      );
+      return;
+    }
+
     if (found && this.settings.updateExisting) {
       const updated = await this.client.updatePage(found.id, title, storage);
       this.mapping.set({
@@ -207,10 +280,20 @@ export class Exporter {
     }
 
     // Create new
+    const parentId =
+      parentIdOverride ?? (this.settings.parentPageId || undefined);
+
+    if (this.settings.dryRun) {
+      console.log(
+        `[DryRun] would create page "${title}" under parentId=${parentId ?? "<none>"}`,
+      );
+      return;
+    }
+
     const created = await this.client.createPage(
       this.settings.spaceKey,
       title,
-      this.settings.parentPageId || undefined,
+      parentId,
       storage,
     );
 
@@ -253,6 +336,24 @@ export class Exporter {
       title,
       updatedAt: nowIso(),
     });
+  }
+
+  private orderRootFirst(root: TFile, files: TFile[]): TFile[] {
+    const map = new Map<string, TFile>();
+    for (const f of files) map.set(f.path, f);
+
+    const out: TFile[] = [];
+    const rootFile = map.get(root.path) ?? root;
+    out.push(rootFile);
+    map.delete(root.path);
+
+    // keep stable-ish ordering by path
+    for (const f of Array.from(map.values()).sort((a, b) =>
+      a.path.localeCompare(b.path),
+    )) {
+      out.push(f);
+    }
+    return out;
   }
 
   private rewriteWikilinksToMarkdownLinks(

@@ -27,7 +27,11 @@ export const DEFAULT_SETTINGS: ConfluenceSettings = {
   updateExisting: true,
   storeContentProperties: true,
 
-  mappingFileName: "confluence-mapping.json"
+  mappingFileName: "confluence-mapping.json",
+
+  dryRun: false,
+  childPagesUnderRoot: true,
+  showProgressNotices: true,
 };
 
 export class ConfluenceSettingTab extends PluginSettingTab {
@@ -45,7 +49,9 @@ export class ConfluenceSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Mode")
-      .setDesc("Auto will try cloud/self-hosted REST paths and pick the first that works.")
+      .setDesc(
+        "Auto will try cloud/self-hosted REST paths and pick the first that works.",
+      )
       .addDropdown((d: any) =>
         d
           .addOption("auto", "Auto")
@@ -56,114 +62,126 @@ export class ConfluenceSettingTab extends PluginSettingTab {
             this.plugin.settings.mode = v as any;
             await this.plugin.saveSettings();
             this.display();
-          })
+          }),
       );
 
     new Setting(containerEl)
-  .setName("Base URL")
-  .setDesc(
-    this.plugin.settings.mode === "selfHosted"
-      ? "Self-hosted example: https://confluence.company.com"
-      : "Cloud example: https://your-site.atlassian.net"
-  )
-  .addText((t: any) =>
-    t.setValue(this.plugin.settings.baseUrl).onChange(async (v: string) => {
-      this.plugin.settings.baseUrl = v.trim();
-      await this.plugin.saveSettings();
-    })
-  );
-
-    new Setting(containerEl)
-      .setName("Auth mode")
-      .addDropdown((d: any) =>
-        d
-          .addOption("bearer", "Bearer (PAT)")
-          .addOption("basic", "Basic (username/email + password/token)")
-          .setValue(this.plugin.settings.authMode)
-          .onChange(async (v: string) => {
-            this.plugin.settings.authMode = v as any;
-            await this.plugin.saveSettings();
-            this.display();
-          })
+      .setName("Base URL")
+      .setDesc(
+        this.plugin.settings.mode === "selfHosted"
+          ? "Self-hosted example: https://confluence.company.com"
+          : "Cloud example: https://your-site.atlassian.net",
+      )
+      .addText((t: any) =>
+        t.setValue(this.plugin.settings.baseUrl).onChange(async (v: string) => {
+          this.plugin.settings.baseUrl = v.trim();
+          await this.plugin.saveSettings();
+        }),
       );
+
+    new Setting(containerEl).setName("Auth mode").addDropdown((d: any) =>
+      d
+        .addOption("bearer", "Bearer (PAT)")
+        .addOption("basic", "Basic (username/email + password/token)")
+        .setValue(this.plugin.settings.authMode)
+        .onChange(async (v: string) => {
+          this.plugin.settings.authMode = v as any;
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+    );
 
     if (this.plugin.settings.authMode === "basic") {
       new Setting(containerEl)
         .setName("Username / Email")
         .setDesc("Cloud: email. Self-hosted: username.")
         .addText((t: any) =>
-          t.setValue(this.plugin.settings.username).onChange(async (v: string) => {
-            this.plugin.settings.username = v.trim();
-            await this.plugin.saveSettings();
-          })
+          t
+            .setValue(this.plugin.settings.username)
+            .onChange(async (v: string) => {
+              this.plugin.settings.username = v.trim();
+              await this.plugin.saveSettings();
+            }),
         );
 
       new Setting(containerEl)
         .setName("Password / Token")
-        .setDesc("Cloud: API token. Self-hosted: password or token (depends on config).")
+        .setDesc(
+          "Cloud: API token. Self-hosted: password or token (depends on config).",
+        )
         .addText((t: any) =>
-          t.setValue(this.plugin.settings.passwordOrToken).onChange(async (v: string) => {
-            this.plugin.settings.passwordOrToken = v;
-            await this.plugin.saveSettings();
-          })
+          t
+            .setValue(this.plugin.settings.passwordOrToken)
+            .onChange(async (v: string) => {
+              this.plugin.settings.passwordOrToken = v;
+              await this.plugin.saveSettings();
+            }),
         );
     } else {
-      new Setting(containerEl)
-        .setName("Bearer token (PAT)")
-        .addText((t: any) =>
-          t.setValue(this.plugin.settings.bearerToken).onChange(async (v: string) => {
+      new Setting(containerEl).setName("Bearer token (PAT)").addText((t: any) =>
+        t
+          .setValue(this.plugin.settings.bearerToken)
+          .onChange(async (v: string) => {
             this.plugin.settings.bearerToken = v.trim();
             await this.plugin.saveSettings();
-          })
-        );
+          }),
+      );
     }
 
     new Setting(containerEl)
       .setName("REST API path override (optional)")
-      .setDesc("Leave empty to auto-detect. Examples: /rest/api, /wiki/rest/api, /confluence/rest/api")
+      .setDesc(
+        "Leave empty to auto-detect. Examples: /rest/api, /wiki/rest/api, /confluence/rest/api",
+      )
       .addText((t: any) =>
-        t.setValue(this.plugin.settings.restApiPathOverride ?? "").onChange(async (v: string) => {
-          this.plugin.settings.restApiPathOverride = v.trim();
-          await this.plugin.saveSettings();
-        })
+        t
+          .setValue(this.plugin.settings.restApiPathOverride ?? "")
+          .onChange(async (v: string) => {
+            this.plugin.settings.restApiPathOverride = v.trim();
+            await this.plugin.saveSettings();
+          }),
       );
 
     new Setting(containerEl)
       .setName("Space Key")
-      .setDesc("Space Key (not the space name). Example: ENG.\n" +
-  "Cloud URL: https://site.atlassian.net/wiki/spaces/ENG/pages/...\n" +
-  "Self-hosted URL: https://confluence.company.com/spaces/ENG/...")
+      .setDesc(
+        "Space Key (not the space name). Example: ENG.\n" +
+          "Cloud URL: https://site.atlassian.net/wiki/spaces/ENG/pages/...\n" +
+          "Self-hosted URL: https://confluence.company.com/spaces/ENG/...",
+      )
       .addText((t: any) =>
-        t.setValue(this.plugin.settings.spaceKey).onChange(async (v: string) => {
-          this.plugin.settings.spaceKey = v.trim();
-          await this.plugin.saveSettings();
-        })
+        t
+          .setValue(this.plugin.settings.spaceKey)
+          .onChange(async (v: string) => {
+            this.plugin.settings.spaceKey = v.trim();
+            await this.plugin.saveSettings();
+          }),
       );
 
     new Setting(containerEl)
       .setName("Parent Page ID (optional)")
       .setDesc("If set, exported pages are created beneath this page.")
       .addText((t: any) =>
-        t.setValue(this.plugin.settings.parentPageId ?? "").onChange(async (v: string) => {
-          this.plugin.settings.parentPageId = v.trim();
-          await this.plugin.saveSettings();
-        })
+        t
+          .setValue(this.plugin.settings.parentPageId ?? "")
+          .onChange(async (v: string) => {
+            this.plugin.settings.parentPageId = v.trim();
+            await this.plugin.saveSettings();
+          }),
       );
 
-    new Setting(containerEl)
-      .setName("Export Mode")
-      .addDropdown((d: any) =>
-        d
-          .addOption("backlinks", "Backlinks (notes linking to current)")
-          .addOption("outlinks", "Outlinks (notes current links to)")
-          .addOption("graph", "Graph crawl (BFS)")
-          .setValue(this.plugin.settings.exportMode)
-          .onChange(async (v: string) => {
-            this.plugin.settings.exportMode = v as ExportMode;
-            await this.plugin.saveSettings();
-            this.display();
-          })
-      );
+    new Setting(containerEl).setName("Export Mode").addDropdown((d: any) =>
+      d
+        .addOption("backlinks", "Backlinks (notes linking to current)")
+        .addOption("outlinks", "Outlinks (notes current links to)")
+        .addOption("graph", "Graph crawl (BFS)")
+        .setValue(this.plugin.settings.exportMode)
+        .onChange(async (v: string) => {
+          this.plugin.settings.exportMode = v as ExportMode;
+          await this.plugin.saveSettings();
+          this.display();
+        }),
+    );
 
     if (this.plugin.settings.exportMode === "graph") {
       new Setting(containerEl)
@@ -177,7 +195,7 @@ export class ConfluenceSettingTab extends PluginSettingTab {
             .onChange(async (v: number) => {
               this.plugin.settings.graphDepth = v;
               await this.plugin.saveSettings();
-            })
+            }),
         );
     }
 
@@ -185,10 +203,50 @@ export class ConfluenceSettingTab extends PluginSettingTab {
       .setName("Update existing pages")
       .setDesc("If enabled, updates pages if found (mapping or title search).")
       .addToggle((t: any) =>
-        t.setValue(this.plugin.settings.updateExisting).onChange(async (v: boolean) => {
-          this.plugin.settings.updateExisting = v;
+        t
+          .setValue(this.plugin.settings.updateExisting)
+          .onChange(async (v: boolean) => {
+            this.plugin.settings.updateExisting = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Dry run")
+      .setDesc(
+        "If enabled, the plugin will calculate what would be exported but will not create/update anything in Confluence.",
+      )
+      .addToggle((t: any) =>
+        t.setValue(this.plugin.settings.dryRun).onChange(async (v: boolean) => {
+          this.plugin.settings.dryRun = v;
           await this.plugin.saveSettings();
-        })
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Create linked pages under root page")
+      .setDesc(
+        "If enabled, pages in the export set (except the root note) are created as children of the root exported page.",
+      )
+      .addToggle((t: any) =>
+        t
+          .setValue(this.plugin.settings.childPagesUnderRoot)
+          .onChange(async (v: boolean) => {
+            this.plugin.settings.childPagesUnderRoot = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Show progress notices")
+      .setDesc("Show periodic notifications during export.")
+      .addToggle((t: any) =>
+        t
+          .setValue(this.plugin.settings.showProgressNotices)
+          .onChange(async (v: boolean) => {
+            this.plugin.settings.showProgressNotices = v;
+            await this.plugin.saveSettings();
+          }),
       );
   }
 }

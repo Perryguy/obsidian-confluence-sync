@@ -12,6 +12,9 @@ export default class ConfluenceSyncPlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.addSettingTab(new ConfluenceSettingTab(this.app, this));
 
+    const status = this.addStatusBarItem();
+    status.setText("Confluence: idle");
+
     this.addCommand({
       id: "confluence-sync-test-connection",
       name: "Confluence Sync: Test connection",
@@ -86,14 +89,23 @@ export default class ConfluenceSyncPlugin extends Plugin {
             this.app,
             this.settings.mappingFileName,
           );
+
           const exporter = new Exporter(
             this.app,
             this.settings,
             client,
             mapping,
+            (text: string) => status.setText(text),
           );
 
-          await exporter.exportFromRoot(file);
+          try {
+            await exporter.exportFromRoot(file);
+            status.setText("Confluence: idle");
+          } catch (e) {
+            status.setText("Confluence: error");
+            throw e;
+          }
+          
         } catch (e: any) {
           console.error(e);
           new Notice(`Export failed: ${e?.message ?? e}`);
