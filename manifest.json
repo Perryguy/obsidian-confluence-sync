@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-confluence-sync",
+  "name": "Confluence Sync",
+  "version": "0.0.1",
+  "minAppVersion": "1.5.0",
+  "description": "Export Obsidian notes and linked notes to Confluence.",
+  "author": "Shaun Perry",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
