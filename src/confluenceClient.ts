@@ -7,7 +7,7 @@ export type ConfluenceMode = "auto" | "cloud" | "selfHosted";
 export type ConfluenceAuthMode = "basic" | "bearer";
 
 export interface ConfluenceClientSettings {
-  baseUrl: string;                 // e.g. https://confluence.des.grp.net OR https://site.atlassian.net/wiki
+  baseUrl: string;                 // e.g. https://confluence.company.net OR https://site.atlassian.net/wiki
   mode: ConfluenceMode;            // auto recommended
   authMode: ConfluenceAuthMode;    // bearer or basic
   username?: string;               // basic: cloud email or selfhost username
