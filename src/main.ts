@@ -2,7 +2,8 @@ import { Plugin, Notice } from "obsidian";
 import type { ConfluenceSettings } from "./types";
 import { ConfluenceSettingTab, DEFAULT_SETTINGS } from "./settings";
 import { ConfluenceClient } from "./confluenceClient";
-import { SimpleConfluenceConverter } from "./simpleConverter";
+import { MappingService } from "./mapping";
+import { Exporter } from "./exporter";
 
 export default class ConfluenceSyncPlugin extends Plugin {
   settings: ConfluenceSettings = DEFAULT_SETTINGS;
@@ -11,7 +12,6 @@ export default class ConfluenceSyncPlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.addSettingTab(new ConfluenceSettingTab(this.app, this));
 
-    // 1) Test connection
     this.addCommand({
       id: "confluence-sync-test-connection",
       name: "Confluence Sync: Test connection",
@@ -36,10 +36,9 @@ export default class ConfluenceSyncPlugin extends Plugin {
       }
     });
 
-    // 2) Export current note (create or update)
     this.addCommand({
-      id: "confluence-sync-export-current",
-      name: "Confluence Sync: Export current note",
+      id: "confluence-sync-export-linked-set",
+      name: "Confluence Sync: Export current + linked set",
       callback: async () => {
         try {
           const file = this.app.workspace.getActiveFile();
@@ -62,27 +61,10 @@ export default class ConfluenceSyncPlugin extends Plugin {
             restApiPathOverride: this.settings.restApiPathOverride
           });
 
-          const md = await this.app.vault.read(file);
-          const converter = new SimpleConfluenceConverter();
-          const storage = converter.convert(md);
+          const mapping = new MappingService(this.app, this.settings.mappingFileName);
+          const exporter = new Exporter(this.app, this.settings, client, mapping);
 
-          const title = file.basename;
-
-          // Create or update (title-based for milestone 2)
-          const existing = await client.searchPageByTitle(this.settings.spaceKey, title);
-
-          if (existing && this.settings.updateExisting) {
-            await client.updatePage(existing.id, title, storage);
-            new Notice(`Updated Confluence page: ${title}`);
-          } else {
-            const created = await client.createPage(
-              this.settings.spaceKey,
-              title,
-              this.settings.parentPageId || undefined,
-              storage
-            );
-            new Notice(`Created Confluence page: ${title} (id ${created.id})`);
-          }
+          await exporter.exportFromRoot(file);
         } catch (e: any) {
           console.error(e);
           new Notice(`Export failed: ${e?.message ?? e}`);

@@ -1,19 +1,17 @@
 export type ExportMode = "backlinks" | "outlinks" | "graph";
-
 export type ConfluenceMode = "auto" | "cloud" | "selfHosted";
 export type ConfluenceAuthMode = "basic" | "bearer";
 
 export interface ConfluenceSettings {
-  baseUrl: string;                 // cloud: https://site.atlassian.net OR https://site.atlassian.net/wiki
-                                  // self-hosted: https://confluence.company OR https://host/confluence
-  mode: ConfluenceMode;            // auto recommended
+  baseUrl: string;
+  mode: ConfluenceMode;
 
-  authMode: ConfluenceAuthMode;    // basic or bearer
-  username: string;                // basic: cloud email OR self-hosted username
-  passwordOrToken: string;         // basic: cloud API token OR self-hosted password/token
-  bearerToken: string;             // bearer: PAT token
+  authMode: ConfluenceAuthMode;
+  username: string;
+  passwordOrToken: string;
+  bearerToken: string;
 
-  restApiPathOverride: string;     // optional: "/wiki/rest/api" or "/confluence/rest/api" or "/rest/api"
+  restApiPathOverride: string;
 
   spaceKey: string;
   parentPageId?: string;
@@ -24,5 +22,18 @@ export interface ConfluenceSettings {
   updateExisting: boolean;
   storeContentProperties: boolean;
 
-  mappingFileName: string;
+  mappingFileName: string; // e.g. confluence-mapping.json
+}
+
+export interface MappingEntry {
+  filePath: string;     // Obsidian path
+  pageId: string;       // Confluence content id
+  title: string;        // Confluence page title
+  webui?: string;       // Relative UI link returned by API (preferred for linking)
+  updatedAt?: string;
+}
+
+export interface MappingStore {
+  version: number;
+  entries: Record<string, MappingEntry>; // key = filePath
 }
