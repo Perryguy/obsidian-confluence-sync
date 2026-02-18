@@ -158,7 +158,7 @@ export class ConfluenceClient {
 
     const res = await requestUrl({
       url,
-      method: "POST",
+      method: "PUT",
       headers: {
         Accept: "application/json",
         "User-Agent": "Obsidian.md",
@@ -233,6 +233,30 @@ export class ConfluenceClient {
     throw new Error(
       `Could not detect Confluence REST root. Tried:\n${errors.join("\n")}`,
     );
+  }
+
+  async addLabels(pageId: string, labels: string[]): Promise<void> {
+    if (labels.length === 0) return;
+    const root = await this.ensureRestRoot();
+    const url = `${root}/content/${pageId}/label`;
+
+    const body = labels.map((name) => ({ prefix: "global", name }));
+
+    const res = await requestUrl({
+      url,
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        ...this.authHeaders(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      throw: false,
+    });
+
+    if (res.status >= 400) {
+      throw new Error(`POST ${url} failed: ${res.status} ${res.text}`);
+    }
   }
 
   // ---------------------------

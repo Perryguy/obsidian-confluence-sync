@@ -224,6 +224,7 @@ export class Exporter {
           storage,
         );
         pageId = updated.id;
+
         webui = updated._links?.webui;
       } catch (e: any) {
         const msg = String(e?.message ?? e);
@@ -270,6 +271,26 @@ export class Exporter {
       webui,
       updatedAt: new Date().toISOString(),
     });
+
+    // 4.5) Apply Confluence labels from Obsidian tags
+    try {
+      const { extractObsidianTags, toConfluenceLabel } = await import("./tags");
+      const tags = extractObsidianTags(md)
+        .map(toConfluenceLabel)
+        .filter(Boolean);
+      await this.client.addLabels(pageId, tags);
+    } catch (e: any) {
+      console.warn("Label sync failed (continuing):", e);
+      new Notice(`Label sync failed for "${title}": ${e?.message ?? e}`);
+    }
+
+    // 5) Upload embeds ALWAYS
+    try {
+      await this.uploadEmbedsForPage(file, pageId);
+    } catch (e: any) {
+      console.error("Attachment upload failed:", e);
+      new Notice(`Attachment upload failed for "${title}": ${e?.message ?? e}`);
+    }
 
     // 5) Upload embeds ALWAYS (and show a Notice on failure)
     try {
