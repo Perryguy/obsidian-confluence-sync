@@ -11,13 +11,19 @@ const common = {
   outfile: "main.js",
   external: ["obsidian"],
   platform: "node",
-  logLevel: "info"
+  logLevel: "info",
 };
 
 if (isProd) {
-  esbuild.build({ ...common, sourcemap: false, minify: true }).catch(() => process.exit(1));
+  esbuild
+    .build({ ...common, sourcemap: false, minify: true })
+    .catch(() => process.exit(1));
 } else {
-  const ctx = await esbuild.context({ ...common, sourcemap: true, minify: false });
+  const ctx = await esbuild.context({
+    ...common,
+    sourcemap: true,
+    minify: false,
+  });
   await ctx.watch();
   console.log("Watching...");
 }

@@ -1,7 +1,7 @@
 import { App, TFile, Notice } from "obsidian";
 import type { ConfluenceSettings, ExportMode } from "./types";
 import type { ConfluenceClient } from "./confluenceClient";
-import { SimpleConfluenceConverter } from "./simpleConverter";
+import { ConfluenceStorageConverter } from "./confluenceStorageConverter";
 import type { MappingService } from "./mapping";
 
 export type ProgressFn = (text: string) => void;
@@ -23,7 +23,7 @@ function joinUrl(base: string, relative: string): string {
 }
 
 export class Exporter {
-  private converter = new SimpleConfluenceConverter();
+  private converter = new ConfluenceStorageConverter();
 
   constructor(
     private app: App,
@@ -206,104 +206,87 @@ export class Exporter {
     file: TFile,
     parentIdOverride?: string,
   ): Promise<void> {
-    const title = basenameTitle(file);
+    const title = file.basename;
     const md = await this.app.vault.read(file);
-
-    // Minimal body for pass1 (no link rewrite yet)
-    const storage = this.converter.convert(md);
+    const storage = this.converter.convert(md, this.makeCtx(file));
 
     const mapped = this.mapping.get(file.path);
 
-    // Prefer mapping
-    if (mapped?.pageId && this.settings.updateExisting) {
+    let pageId: string | null = null;
+    let webui: string | undefined;
 
-      if (this.settings.dryRun) {
-        console.log(
-          `[DryRun] would update mapped page "${title}" id=${mapped.pageId}`,
-        );
-        return;
-      }
-      
+    // 1) Try mapped update
+    if (mapped?.pageId && this.settings.updateExisting) {
       try {
         const updated = await this.client.updatePage(
           mapped.pageId,
           title,
           storage,
         );
-
-        this.mapping.set({
-          filePath: file.path,
-          pageId: updated.id,
-          title,
-          webui: updated._links?.webui,
-          updatedAt: nowIso(),
-        });
-
-        return;
+        pageId = updated.id;
+        webui = updated._links?.webui;
       } catch (e: any) {
         const msg = String(e?.message ?? e);
-        // Page deleted or moved in Confluence → mapping is stale
         if (msg.includes(" 404")) {
-          console.warn(
-            `[Confluence] Mapped pageId missing (will recreate): ${mapped.pageId} for ${file.path}`,
-          );
-          this.mapping.remove(file.path); // drop stale mapping and fall through
+          this.mapping.remove(file.path);
         } else {
           throw e;
         }
       }
     }
 
-    // Fallback: search by title
-    const found = await this.client.searchPageByTitle(
-      this.settings.spaceKey,
-      title,
-    );
-
-    if (this.settings.dryRun) {
-      console.log(
-        `[DryRun] would update found-by-title page "${title}" id=${found?.id}`,
-      );
-      return;
-    }
-
-    if (found && this.settings.updateExisting) {
-      const updated = await this.client.updatePage(found.id, title, storage);
-      this.mapping.set({
-        filePath: file.path,
-        pageId: updated.id,
+    // 2) Try title search update
+    if (!pageId && this.settings.updateExisting) {
+      const found = await this.client.searchPageByTitle(
+        this.settings.spaceKey,
         title,
-        webui: updated._links?.webui,
-        updatedAt: nowIso(),
-      });
-      return;
-    }
-
-    // Create new
-    const parentId =
-      parentIdOverride ?? (this.settings.parentPageId || undefined);
-
-    if (this.settings.dryRun) {
-      console.log(
-        `[DryRun] would create page "${title}" under parentId=${parentId ?? "<none>"}`,
       );
-      return;
+      if (found) {
+        const updated = await this.client.updatePage(found.id, title, storage);
+        pageId = updated.id;
+        webui = updated._links?.webui;
+      }
     }
 
-    const created = await this.client.createPage(
-      this.settings.spaceKey,
-      title,
-      parentId,
-      storage,
-    );
+    // 3) Create
+    if (!pageId) {
+      const parentId =
+        parentIdOverride ?? (this.settings.parentPageId || undefined);
+      const created = await this.client.createPage(
+        this.settings.spaceKey,
+        title,
+        parentId,
+        storage,
+      );
+      pageId = created.id;
+      webui = created._links?.webui;
+    }
 
+    // 4) Save mapping
     this.mapping.set({
       filePath: file.path,
-      pageId: created.id,
+      pageId,
       title,
-      webui: created._links?.webui,
-      updatedAt: nowIso(),
+      webui,
+      updatedAt: new Date().toISOString(),
     });
+
+    // 5) Upload embeds ALWAYS (and show a Notice on failure)
+    try {
+      await this.uploadEmbedsForPage(file, pageId);
+    } catch (e: any) {
+      console.error("Attachment upload failed:", e);
+      new Notice(`Attachment upload failed for "${title}": ${e?.message ?? e}`);
+    }
+  }
+
+  private async uploadEmbedsForPage(
+    file: TFile,
+    pageId: string,
+  ): Promise<void> {
+    const md = await this.app.vault.read(file);
+    const { uploadEmbeddedImages } = await import("./attachments");
+    await uploadEmbeddedImages(this.app, this.client, pageId, file, md);
   }
 
   // Pass 2: rewrite wikilinks using mapping, then update
@@ -311,11 +294,10 @@ export class Exporter {
     const entry = this.mapping.get(file.path);
     if (!entry?.pageId) return;
 
-    const title = basenameTitle(file);
+    const title = file.basename;
     const md = await this.app.vault.read(file);
 
-    const rewritten = this.rewriteWikilinksToMarkdownLinks(md, file);
-    const storage = this.converter.convert(rewritten);
+    const storage = this.converter.convert(md, this.makeCtx(file));
 
     try {
       await this.client.updatePage(entry.pageId, title, storage);
@@ -326,7 +308,7 @@ export class Exporter {
           `[Confluence] Page missing during pass2 update (skipping): ${entry.pageId} for ${file.path}`,
         );
         this.mapping.remove(file.path);
-        return; // next export will recreate
+        return;
       }
       throw e;
     }
@@ -334,8 +316,34 @@ export class Exporter {
     this.mapping.set({
       ...entry,
       title,
-      updatedAt: nowIso(),
+      updatedAt: new Date().toISOString(),
     });
+  }
+
+  private makeCtx(file: TFile) {
+    return {
+      spaceKey: this.settings.spaceKey,
+      fromPath: file.path,
+      resolveWikiLink: (target: string, fromPath: string) => {
+        const dest = this.app.metadataCache.getFirstLinkpathDest(
+          target,
+          fromPath,
+        );
+
+        if (dest instanceof TFile) {
+          // If it's a markdown note → link to page title
+          if (dest.extension === "md") {
+            const mapped = this.mapping.get(dest.path);
+            return { title: mapped?.title ?? dest.basename };
+          }
+
+          // If it's an asset (image) → return filename for <ri:attachment>
+          return { title: dest.name };
+        }
+
+        return null;
+      },
+    };
   }
 
   private orderRootFirst(root: TFile, files: TFile[]): TFile[] {
@@ -354,39 +362,5 @@ export class Exporter {
       out.push(f);
     }
     return out;
-  }
-
-  private rewriteWikilinksToMarkdownLinks(
-    markdown: string,
-    fromFile: TFile,
-  ): string {
-    // Supports: [[Note]] and [[Note|Alias]] and [[Note#Heading]] (heading ignored)
-    // Converts to standard markdown link: [Alias](<absolute_confluence_url>)
-    // Uses mapping webui if available; else falls back to plain text.
-
-    const base = this.settings.baseUrl.replace(/\/+$/, ""); // for Cloud this likely includes /wiki
-    return markdown.replace(
-      /\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]/g,
-      (_m, rawTarget, rawAlias) => {
-        const target = String(rawTarget).trim();
-        const alias = rawAlias ? String(rawAlias).trim() : target;
-
-        // Resolve Obsidian link to a file, then look up mapping by file path
-        const dest = this.app.metadataCache.getFirstLinkpathDest(
-          target,
-          fromFile.path,
-        );
-        if (dest instanceof TFile) {
-          const mapped = this.mapping.get(dest.path);
-          if (mapped?.webui) {
-            const url = joinUrl(base, mapped.webui);
-            return `[${alias}](${url})`;
-          }
-        }
-
-        // If we can't resolve/match, keep readable text
-        return alias;
-      },
-    );
   }
 }

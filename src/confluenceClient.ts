@@ -1,178 +1,342 @@
-import { requestUrl, RequestUrlParam } from "obsidian";
+// src/confluenceClient.ts
+import { requestUrl, type RequestUrlResponse } from "obsidian";
 
-type HttpMethod = "GET" | "POST" | "PUT";
+type ConfluenceMode = "auto" | "cloud" | "selfHosted";
+type ConfluenceAuthMode = "basic" | "bearer";
 
-export type ConfluenceMode = "auto" | "cloud" | "selfHosted";
-export type ConfluenceAuthMode = "basic" | "bearer";
-
-export interface ConfluenceClientSettings {
-  baseUrl: string;
+export interface ConfluenceClientConfig {
+  baseUrl: string; // Cloud: https://site.atlassian.net/wiki   OR https://site.atlassian.net (we'll handle)
   mode: ConfluenceMode;
 
   authMode: ConfluenceAuthMode;
   username: string;
-  passwordOrToken: string;
-  bearerToken: string;
+  passwordOrToken: string; // basic: password or cloud api token
+  bearerToken: string; // bearer: PAT
 
-  restApiPathOverride: string;
+  restApiPathOverride?: string; // "", "/wiki/rest/api", "/rest/api", "/confluence/rest/api", etc.
 }
 
-export interface ConfluencePage {
+export interface ConfluenceLinks {
+  webui?: string;
+  tinyui?: string;
+  self?: string;
+}
+
+export interface ConfluenceContent {
   id: string;
+  type?: string;
   title: string;
-  version: { number: number };
-  _links?: { webui?: string };
+  _links?: ConfluenceLinks;
+  version?: { number: number };
+}
+
+function stripTrailingSlashes(s: string): string {
+  return s.replace(/\/+$/, "");
+}
+function ensureLeadingSlash(s: string): string {
+  if (!s) return "";
+  return s.startsWith("/") ? s : `/${s}`;
 }
 
 export class ConfluenceClient {
-  private restRoot: string | null = null;
+  private restRootCache?: string;
 
-  constructor(private s: ConfluenceClientSettings) {}
+  constructor(private cfg: ConfluenceClientConfig) {}
 
-  private base(): string {
-    return (this.s.baseUrl || "").replace(/\/+$/, "");
-  }
-
-  private authHeaders(): Record<string, string> {
-    if (this.s.authMode === "bearer") {
-      if (!this.s.bearerToken) throw new Error("Bearer token missing.");
-      return { Authorization: `Bearer ${this.s.bearerToken}` };
-    }
-
-    if (!this.s.username || !this.s.passwordOrToken) throw new Error("Username/password-or-token missing.");
-    const basic = btoa(`${this.s.username}:${this.s.passwordOrToken}`);
-    return { Authorization: `Basic ${basic}` };
-  }
-
-  private candidateRestRoots(): string[] {
-    const base = this.base();
-    if (!base) return [];
-
-    // Explicit override wins
-    if (this.s.restApiPathOverride?.trim()) {
-      const p = this.s.restApiPathOverride.startsWith("/")
-        ? this.s.restApiPathOverride
-        : `/${this.s.restApiPathOverride}`;
-      return [(`${base}${p}`).replace(/\/+$/, "")];
-    }
-
-    const looksCloud = base.includes("atlassian.net");
-    const mode = this.s.mode;
-
-    const roots: string[] = [];
-    const add = (suffix: string) => roots.push(`${base}${suffix}`);
-
-    if (mode === "cloud" || (mode === "auto" && looksCloud)) {
-      // If base already includes /wiki, it should be .../wiki/rest/api
-      if (base.endsWith("/wiki")) add("/rest/api");
-      else add("/wiki/rest/api");
-
-      add("/rest/api"); // fallback
-      return Array.from(new Set(roots.map(r => r.replace(/\/+$/, ""))));
-    }
-
-    // self-hosted default
-    add("/rest/api");
-    add("/wiki/rest/api"); // fallback in case of reverse proxy mapping
-    return Array.from(new Set(roots.map(r => r.replace(/\/+$/, ""))));
-  }
-
-  private async ensureRestRoot(): Promise<string> {
-    if (this.restRoot) return this.restRoot;
-
-    const candidates = this.candidateRestRoots();
-    if (candidates.length === 0) throw new Error("Base URL is empty.");
-
-    const errors: string[] = [];
-
-    for (const root of candidates) {
-      try {
-        // Lightweight probe:
-        await this.rawCall("GET", `${root}/space?limit=1`, undefined, true);
-        this.restRoot = root;
-        return root;
-      } catch (e: any) {
-        errors.push(`${root} -> ${e?.message ?? e}`);
-      }
-    }
-
-    throw new Error(
-      `Could not detect Confluence REST API root.\nTried:\n${errors.map(e => `- ${e}`).join("\n")}\n\n` +
-        `If your Confluence is behind a context path (e.g. https://host/confluence), set Base URL to include it ` +
-        `or set REST API path override to something like "/confluence/rest/api".`
-    );
-  }
-
-  private async rawCall<T>(
-    method: HttpMethod,
-    url: string,
-    body?: any,
-    noJsonParse?: boolean
-  ): Promise<T> {
-    const req: RequestUrlParam = {
-      url,
-      method,
-      headers: {
-        ...this.authHeaders(),
-        Accept: "application/json",
-        ...(body ? { "Content-Type": "application/json" } : {})
-      },
-      body: body ? JSON.stringify(body) : undefined
-    };
-
-    const res = await requestUrl(req);
-    if (res.status >= 400) throw new Error(`${method} ${url} failed: ${res.status} ${res.text}`);
-    return (noJsonParse ? ({} as T) : (res.json as T));
-  }
-
-  private async call<T>(method: HttpMethod, path: string, body?: any): Promise<T> {
-    const root = await this.ensureRestRoot();
-    return this.rawCall<T>(method, `${root}${path}`, body);
-  }
+  // ---------------------------
+  // Public API used by exporter
+  // ---------------------------
 
   async ping(): Promise<string> {
     const root = await this.ensureRestRoot();
+    // A lightweight endpoint that exists on both Cloud and DC/Server
+    await this.rawCall("GET", `${root}/space?limit=1`);
     return root;
   }
 
-  async searchPageByTitle(spaceKey: string, title: string): Promise<ConfluencePage | null> {
-    // Exact title match via CQL
-    const cql = `type=page AND space="${spaceKey}" AND title="${title.replace(/"/g, '\\"')}"`;
-    const result = await this.call<{ results: ConfluencePage[] }>(
-      "GET",
-      `/content/search?cql=${encodeURIComponent(cql)}&expand=version`
-    );
-    return result.results?.[0] ?? null;
+  async searchPageByTitle(
+    spaceKey: string,
+    title: string,
+  ): Promise<ConfluenceContent | null> {
+    const root = await this.ensureRestRoot();
+    const q = `type=page AND space="${spaceKey}" AND title="${title.replace(/"/g, '\\"')}"`;
+    const url = `${root}/content/search?cql=${encodeURIComponent(q)}&limit=1`;
+
+    const res = await this.rawCall("GET", url);
+    const json = this.safeJson(res.text);
+    const r = json?.results?.[0];
+    if (!r?.id) return null;
+    return {
+      id: String(r.id),
+      title: String(r.title ?? title),
+      _links: r._links,
+      version: r.version,
+    };
   }
 
-  async getPage(pageId: string): Promise<ConfluencePage> {
-    return this.call<ConfluencePage>("GET", `/content/${pageId}?expand=version`);
-  }
-
-  async createPage(spaceKey: string, title: string, parentId: string | undefined, storageValue: string): Promise<ConfluencePage> {
+  async createPage(
+    spaceKey: string,
+    title: string,
+    parentPageId: string | undefined,
+    storageValue: string,
+  ): Promise<ConfluenceContent> {
+    const root = await this.ensureRestRoot();
     const body: any = {
       type: "page",
       title,
       space: { key: spaceKey },
-      body: { storage: { value: storageValue, representation: "storage" } }
+      body: { storage: { value: storageValue, representation: "storage" } },
     };
-    if (parentId) body.ancestors = [{ id: parentId }];
 
-    return this.call<ConfluencePage>("POST", `/content`, body);
+    if (parentPageId) {
+      body.ancestors = [{ id: parentPageId }];
+    }
+
+    const res = await this.rawCall("POST", `${root}/content`, body);
+    const json = this.safeJson(res.text);
+
+    return {
+      id: String(json?.id),
+      title: String(json?.title ?? title),
+      _links: json?._links,
+      version: json?.version,
+    };
   }
 
-  async updatePage(pageId: string, title: string, storageValue: string): Promise<ConfluencePage> {
-    const current = await this.getPage(pageId);
-    const nextVersion = (current.version?.number ?? 1) + 1;
+  async updatePage(
+    pageId: string,
+    title: string,
+    storageValue: string,
+  ): Promise<ConfluenceContent> {
+    const root = await this.ensureRestRoot();
+
+    // Need current version
+    const currentRes = await this.rawCall(
+      "GET",
+      `${root}/content/${pageId}?expand=version`,
+    );
+    const current = this.safeJson(currentRes.text);
+    const currentVersion = Number(current?.version?.number ?? 1);
 
     const body = {
       id: pageId,
       type: "page",
       title,
-      version: { number: nextVersion },
-      body: { storage: { value: storageValue, representation: "storage" } }
+      version: { number: currentVersion + 1 },
+      body: { storage: { value: storageValue, representation: "storage" } },
     };
 
-    return this.call<ConfluencePage>("PUT", `/content/${pageId}`, body);
+    const res = await this.rawCall("PUT", `${root}/content/${pageId}`, body);
+    const json = this.safeJson(res.text);
+
+    return {
+      id: String(json?.id ?? pageId),
+      title: String(json?.title ?? title),
+      _links: json?._links,
+      version: json?.version,
+    };
+  }
+
+  /**
+   * Confluence Cloud attachments:
+   * PUT /wiki/rest/api/content/{id}/child/attachment
+   * Must include X-Atlassian-Token: nocheck for multipart/form-data.
+   *
+   * We use requestUrl + a manually-built multipart body to avoid CORS.
+   */
+  async uploadAttachment(
+    pageId: string,
+    filename: string,
+    data: ArrayBuffer,
+  ): Promise<void> {
+    const root = await this.ensureRestRoot();
+    const url = `${root}/content/${pageId}/child/attachment`;
+    const safeName = filename.replace(/[\r\n"]/g, "_");
+    const boundary = `----WebKitFormBoundary${Math.random().toString(16).slice(2)}${Date.now()}`;
+    const mime = this.guessMime(safeName);
+    const bodyBytes = this.buildMultipartBody(safeName, mime, data, boundary);
+
+    const res = await requestUrl({
+      url,
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Obsidian.md",
+        ...this.authHeaders(),
+        "X-Atlassian-Token": "nocheck",
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      },
+      body: bodyBytes.buffer as any,
+      throw: false,
+    });
+
+    if (res.status >= 400) {
+      // Now you'll finally see Atlassian's actual error message in res.text
+      throw new Error(`POST ${url} failed: ${res.status} ${res.text}`);
+    }
+  }
+
+  // ---------------------------
+  // REST root detection
+  // ---------------------------
+
+  async ensureRestRoot(): Promise<string> {
+    if (this.restRootCache) return this.restRootCache;
+
+    const base = stripTrailingSlashes(this.cfg.baseUrl);
+    const override = (this.cfg.restApiPathOverride ?? "").trim();
+
+    if (override) {
+      // If they put full "/wiki/rest/api" or "/rest/api", honor it
+      const rest = `${base}${ensureLeadingSlash(override)}`.replace(/\/+$/, "");
+      // Probe quickly
+      await this.rawCall("GET", `${rest}/space?limit=1`);
+      this.restRootCache = rest;
+      return rest;
+    }
+
+    // Candidate list
+    const candidates: string[] = [];
+
+    // If base already includes /wiki, treat it as Cloud base and try /rest/api
+    if (base.endsWith("/wiki")) {
+      candidates.push(`${base}/rest/api`);
+    } else {
+      // Cloud
+      candidates.push(`${base}/wiki/rest/api`);
+      // Self-hosted common
+      candidates.push(`${base}/rest/api`);
+      candidates.push(`${base}/confluence/rest/api`);
+    }
+
+    // Mode filtering
+    const mode = this.cfg.mode;
+    const filtered =
+      mode === "cloud"
+        ? candidates.filter((c) => c.includes("/wiki/"))
+        : mode === "selfHosted"
+          ? candidates.filter((c) => !c.includes("/wiki/"))
+          : candidates;
+
+    const errors: string[] = [];
+
+    for (const rest of filtered) {
+      try {
+        await this.rawCall("GET", `${rest}/space?limit=1`);
+        this.restRootCache = rest;
+        return rest;
+      } catch (e: any) {
+        errors.push(`${rest}/space?limit=1 -> ${e?.message ?? e}`);
+      }
+    }
+
+    throw new Error(
+      `Could not detect Confluence REST root. Tried:\n${errors.join("\n")}`,
+    );
+  }
+
+  // ---------------------------
+  // Low-level HTTP helpers
+  // ---------------------------
+
+  private authHeaders(): Record<string, string> {
+    if (this.cfg.authMode === "bearer") {
+      const token = (this.cfg.bearerToken ?? "").trim();
+      return token ? { Authorization: `Bearer ${token}` } : {};
+    }
+
+    // basic
+    const user = this.cfg.username ?? "";
+    const pass = this.cfg.passwordOrToken ?? "";
+    const encoded = btoa(`${user}:${pass}`);
+    return { Authorization: `Basic ${encoded}` };
+  }
+
+  private async rawCall(
+    method: "GET" | "POST" | "PUT",
+    url: string,
+    jsonBody?: any,
+  ): Promise<RequestUrlResponse> {
+    // requestUrl bypasses CORS (good for Obsidian desktop)
+    const res = await requestUrl({
+      url,
+      method,
+      headers: {
+        ...this.authHeaders(),
+        Accept: "application/json",
+        ...(jsonBody ? { "Content-Type": "application/json" } : {}),
+      },
+      body: jsonBody ? JSON.stringify(jsonBody) : undefined,
+    });
+
+    if (res.status >= 400) {
+      throw new Error(`${method} ${url} failed: ${res.status} ${res.text}`);
+    }
+    return res;
+  }
+
+  private safeJson(text: string): any {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
+  private guessMime(filename: string): string {
+    const ext = filename.split(".").pop()?.toLowerCase();
+    switch (ext) {
+      case "png":
+        return "image/png";
+      case "jpg":
+      case "jpeg":
+        return "image/jpeg";
+      case "gif":
+        return "image/gif";
+      case "webp":
+        return "image/webp";
+      case "svg":
+        return "image/svg+xml";
+      default:
+        return "application/octet-stream";
+    }
+  }
+
+  /**
+   * Builds a multipart/form-data body with:
+   *  - comment field
+   *  - file field
+   *
+   * Returns Uint8Array so requestUrl won't coerce it to string.
+   */
+  private buildMultipartBody(
+    filename: string,
+    mime: string,
+    data: ArrayBuffer,
+    boundary: string,
+  ): Uint8Array {
+    const enc = new TextEncoder();
+
+    // IMPORTANT: file field name must be exactly "file"
+    const head =
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+      `Content-Type: ${mime}\r\n` +
+      `\r\n`;
+
+    const tail = `\r\n--${boundary}--\r\n`;
+
+    const headBytes = enc.encode(head);
+    const fileBytes = new Uint8Array(data);
+    const tailBytes = enc.encode(tail);
+
+    const out = new Uint8Array(
+      headBytes.length + fileBytes.length + tailBytes.length,
+    );
+    out.set(headBytes, 0);
+    out.set(fileBytes, headBytes.length);
+    out.set(tailBytes, headBytes.length + fileBytes.length);
+
+    return out;
   }
 }
