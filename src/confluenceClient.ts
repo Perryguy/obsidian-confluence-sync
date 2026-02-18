@@ -363,4 +363,28 @@ export class ConfluenceClient {
 
     return out;
   }
+
+  async getPage(pageId: string) {
+    const root = await this.ensureRestRoot();
+    const res = await requestUrl({
+      url: `${root}/content/${pageId}?expand=version,_links`,
+      method: "GET",
+      headers: { Accept: "application/json", ...this.authHeaders() },
+      throw: false,
+    });
+
+    if (res.status >= 400)
+      throw new Error(
+        `GET content/${pageId} failed: ${res.status} ${res.text}`,
+      );
+    return JSON.parse(res.text);
+  }
+
+  // Confluence returns _links.webui like "/spaces/KEY/pages/123/Title"
+  toWebUrl(webuiPath: string): string {
+    // Derive site base from cfg.baseUrl
+    const base = this.cfg.baseUrl.replace(/\/+$/, "");
+    if (webuiPath.startsWith("http")) return webuiPath;
+    return `${base}${webuiPath.startsWith("/") ? "" : "/"}${webuiPath}`;
+  }
 }

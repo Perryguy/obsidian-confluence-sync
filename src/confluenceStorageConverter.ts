@@ -33,13 +33,94 @@ function codeMacro(code: string, language?: string): string {
   );
 }
 
-function panelMacro(title: string, bodyStorage: string): string {
+function panelColorsFor(type: string) {
+  switch (type) {
+    case "warning":
+    case "caution":
+      return {
+        borderColor: "#FFAB00",
+        bgColor: "#FFFAE6",
+        titleBGColor: "#FFAB00",
+        titleColor: "#172B4D",
+      };
+    case "danger":
+    case "error":
+    case "fail":
+      return {
+        borderColor: "#DE350B",
+        bgColor: "#FFEBE6",
+        titleBGColor: "#DE350B",
+        titleColor: "#FFFFFF",
+      };
+    case "success":
+    case "done":
+    case "check":
+      return {
+        borderColor: "#36B37E",
+        bgColor: "#E3FCEF",
+        titleBGColor: "#36B37E",
+        titleColor: "#FFFFFF",
+      };
+    case "tip":
+    case "hint":
+      return {
+        borderColor: "#00B8D9",
+        bgColor: "#E6FCFF",
+        titleBGColor: "#00B8D9",
+        titleColor: "#172B4D",
+      };
+    case "note":
+    case "info":
+    default:
+      return {
+        borderColor: "#4C9AFF",
+        bgColor: "#DEEBFF",
+        titleBGColor: "#4C9AFF",
+        titleColor: "#FFFFFF",
+      };
+  }
+}
+
+function panelMacro(title: string, bodyStorage: string, type: string): string {
+  const c = panelColorsFor(type);
+
   return (
     `<ac:structured-macro ac:name="panel">` +
     `<ac:parameter ac:name="title">${escapeXml(title)}</ac:parameter>` +
+    `<ac:parameter ac:name="borderStyle">solid</ac:parameter>` +
+    `<ac:parameter ac:name="borderWidth">1</ac:parameter>` +
+    `<ac:parameter ac:name="borderColor">${c.borderColor}</ac:parameter>` +
+    `<ac:parameter ac:name="bgColor">${c.bgColor}</ac:parameter>` +
+    `<ac:parameter ac:name="titleBGColor">${c.titleBGColor}</ac:parameter>` +
+    `<ac:parameter ac:name="titleColor">${c.titleColor}</ac:parameter>` +
     `<ac:rich-text-body>${bodyStorage}</ac:rich-text-body>` +
     `</ac:structured-macro>`
   );
+}
+
+function panelStyleFor(type: string): string {
+  // Confluence panelStyle supports CSS-like style string
+  // Keep it conservative so Cloud accepts it.
+  switch (type) {
+    case "warning":
+    case "caution":
+      return "border-color: #FFAB00; background-color: #FFFAE6;";
+    case "danger":
+    case "error":
+    case "fail":
+      return "border-color: #DE350B; background-color: #FFEBE6;";
+    case "success":
+    case "done":
+    case "check":
+      return "border-color: #36B37E; background-color: #E3FCEF;";
+    case "tip":
+    case "hint":
+      return "border-color: #00B8D9; background-color: #E6FCFF;";
+    case "note":
+    case "info":
+    default:
+      return "border-color: #4C9AFF; background-color: #DEEBFF;";
+  }
 }
 
 function confluencePageLink(
@@ -418,29 +499,38 @@ export class ConfluenceStorageConverter {
   }
 
   private tryParseCallout(
-    tokens: MdToken[],
+    tokens: any[],
     blockquoteOpenIndex: number,
     ctx: ConvertContext,
   ): { rendered: string; nextIndex: number } | null {
     // Expect:
     // blockquote_open
     // paragraph_open
-    // inline (starts with [!type] Title)
+    // inline (header + maybe body in same paragraph)
     // paragraph_close
     if (tokens[blockquoteOpenIndex]?.type !== "blockquote_open") return null;
     if (tokens[blockquoteOpenIndex + 1]?.type !== "paragraph_open") return null;
 
-    const inline = tokens[blockquoteOpenIndex + 2];
-    if (!inline || inline.type !== "inline") return null;
+    const inlineTok = tokens[blockquoteOpenIndex + 2];
+    if (!inlineTok || inlineTok.type !== "inline") return null;
 
-    const text = (inline.children ?? [])
-      .map((ch: MdToken) => ch.content ?? "")
-      .join("");
+    const children: any[] = inlineTok.children ?? [];
+    if (children.length === 0) return null;
 
-    const m = text.match(/^\s*\[!(\w+)\]\s*(.*)\s*$/);
+    // Split inline children at the first line break (softbreak/hardbreak)
+    const brIndex = children.findIndex(
+      (t) => t.type === "softbreak" || t.type === "hardbreak",
+    );
+    const headerChildren =
+      brIndex === -1 ? children : children.slice(0, brIndex);
+    const restChildren = brIndex === -1 ? [] : children.slice(brIndex + 1);
+
+    const headerText = this.inlinePlainText(headerChildren).trim();
+    const m = headerText.match(/^\s*\[!([a-zA-Z]+)\]\s*(.*)\s*$/);
     if (!m) return null;
 
-    const title = (m[2]?.trim() || m[1] || "Callout").trim();
+    const calloutType = (m[1] ?? "info").toLowerCase();
+    const title = (m[2]?.trim() || calloutType.toUpperCase()).trim();
 
     // Find matching blockquote_close
     let depth = 0;
@@ -454,12 +544,27 @@ export class ConfluenceStorageConverter {
     }
     if (j >= tokens.length) return null;
 
-    // body tokens begin after paragraph_close that ends the callout header line
-    const bodyStart = blockquoteOpenIndex + 4;
-    const bodyEnd = j;
-    const bodyTokens = tokens.slice(bodyStart, bodyEnd);
+    // Build body tokens:
+    //  - If there was remaining content in the first paragraph, keep it as a paragraph.
+    //  - Then include the rest of the blockquote tokens after the first paragraph_close.
+    const body: any[] = [];
 
-    const bodyStorage = this.renderBlock(bodyTokens, ctx);
-    return { rendered: panelMacro(title, bodyStorage), nextIndex: j + 1 };
+    if (restChildren.length > 0) {
+      // Recreate the paragraph with remaining inline children
+      body.push({ type: "paragraph_open", tag: "p" });
+      body.push({ type: "inline", children: restChildren });
+      body.push({ type: "paragraph_close", tag: "p" });
+    }
+
+    // After paragraph_close comes the rest of the blockquote content
+    // header structure indexes: open, p_open, inline, p_close
+    const afterFirstParagraph = blockquoteOpenIndex + 4;
+    for (let k = afterFirstParagraph; k < j; k++) body.push(tokens[k]);
+
+    const bodyStorage = this.renderBlock(body, ctx);
+    return {
+      rendered: panelMacro(title, bodyStorage, calloutType),
+      nextIndex: j + 1,
+    };
   }
 }

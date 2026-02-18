@@ -112,6 +112,83 @@ export class Exporter {
       new Notice("Confluence export complete.");
   }
 
+  public async collectExportSet(root: TFile): Promise<TFile[]> {
+    await this.mapping.load();
+    const files = await this.buildExportSet(root);
+    return this.orderRootFirst(root, files);
+  }
+
+  public async exportFromRootSelected(
+    root: TFile,
+    selectedPaths: Set<string>,
+  ): Promise<void> {
+    await this.mapping.load();
+
+    const files = await this.buildExportSet(root);
+    const ordered = this.orderRootFirst(root, files).filter((f) =>
+      selectedPaths.has(f.path),
+    );
+
+    if (ordered.length === 0) {
+      new Notice("Nothing selected to export.");
+      return;
+    }
+
+    // --- copy/paste your exportFromRoot body, replacing `ordered` usage ---
+    // Pass 1 root first (if included)
+    const rootIncluded = ordered.some((f) => f.path === root.path);
+
+    if (rootIncluded) {
+      this.progress(`Confluence: Pass 1/2 (root) ${root.basename}`);
+      await this.ensurePageForFile(root, undefined);
+      await this.mapping.save();
+    }
+
+    const rootEntry = this.mapping.get(root.path);
+    const rootPageId = rootEntry?.pageId;
+
+    const parentOverride =
+      this.settings.childPagesUnderRoot && rootPageId
+        ? rootPageId
+        : this.settings.parentPageId || undefined;
+
+    // Pass 1: remaining selected pages
+    let idx = 0;
+    const others = ordered.filter((f) => f.path !== root.path);
+
+    for (const f of others) {
+      idx++;
+      this.progress(
+        `Confluence: Pass 1/2 (${idx}/${others.length}) ${f.basename}`,
+      );
+      await this.ensurePageForFile(f, parentOverride);
+      if (idx % 5 === 0) await this.mapping.save();
+    }
+
+    await this.mapping.save();
+
+    if (this.settings.dryRun) {
+      this.progress(`Confluence: DRY RUN complete (${ordered.length} notes)`);
+      if (this.settings.showProgressNotices) new Notice("Dry run complete.");
+      return;
+    }
+
+    // Pass 2: rewrite links only for selected
+    let j = 0;
+    for (const f of ordered) {
+      j++;
+      this.progress(
+        `Confluence: Pass 2/2 (${j}/${ordered.length}) ${f.basename}`,
+      );
+      await this.updatePageContentWithLinks(f);
+    }
+
+    await this.mapping.save();
+    this.progress("Confluence: export complete");
+    if (this.settings.showProgressNotices)
+      new Notice("Confluence export complete.");
+  }
+
   // Export set discovery
   private async buildExportSet(root: TFile): Promise<TFile[]> {
     const mode = this.settings.exportMode;
@@ -285,14 +362,6 @@ export class Exporter {
     }
 
     // 5) Upload embeds ALWAYS
-    try {
-      await this.uploadEmbedsForPage(file, pageId);
-    } catch (e: any) {
-      console.error("Attachment upload failed:", e);
-      new Notice(`Attachment upload failed for "${title}": ${e?.message ?? e}`);
-    }
-
-    // 5) Upload embeds ALWAYS (and show a Notice on failure)
     try {
       await this.uploadEmbedsForPage(file, pageId);
     } catch (e: any) {
