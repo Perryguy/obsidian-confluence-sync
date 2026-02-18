@@ -1,0 +1,60 @@
+name: Build & Release (Obsidian Plugin)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Adjust paths if your build outputs somewhere else.
+      # Common Obsidian plugin output is:
+      # - main.js
+      # - manifest.json
+      # - styles.css (optional)
+      - name: Verify artifacts
+        run: |
+          ls -la
+          test -f main.js
+          test -f manifest.json
+          if [ -f styles.css ]; then echo "styles.css found"; else echo "styles.css not present (ok)"; fi
+
+      - name: Create plugin folder for zip
+        run: |
+          mkdir -p obsidian-confluence-sync
+          cp main.js manifest.json obsidian-confluence-sync/
+          if [ -f styles.css ]; then cp styles.css obsidian-confluence-sync/; fi
+          cd obsidian-confluence-sync
+          zip -r ../obsidian-confluence-sync.zip .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            main.js
+            manifest.json
+            styles.css
+            obsidian-confluence-sync.zip
