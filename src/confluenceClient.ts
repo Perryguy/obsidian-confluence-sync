@@ -1,19 +1,18 @@
-// src/confluenceClient.ts
 import { requestUrl, type RequestUrlResponse } from "obsidian";
 
 type ConfluenceMode = "auto" | "cloud" | "selfHosted";
 type ConfluenceAuthMode = "basic" | "bearer";
 
 export interface ConfluenceClientConfig {
-  baseUrl: string; // Cloud: https://site.atlassian.net/wiki   OR https://site.atlassian.net (we'll handle)
+  baseUrl: string;
   mode: ConfluenceMode;
 
   authMode: ConfluenceAuthMode;
   username: string;
-  passwordOrToken: string; // basic: password or cloud api token
-  bearerToken: string; // bearer: PAT
+  passwordOrToken: string;
+  bearerToken: string;
 
-  restApiPathOverride?: string; // "", "/wiki/rest/api", "/rest/api", "/confluence/rest/api", etc.
+  restApiPathOverride?: string;
 }
 
 export interface ConfluenceLinks {
@@ -38,6 +37,11 @@ function ensureLeadingSlash(s: string): string {
   return s.startsWith("/") ? s : `/${s}`;
 }
 
+function escapeCqlStringLiteral(value: string): string {
+  // Escape backslashes first, then double quotes, to avoid creating unescaped quotes.
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 export class ConfluenceClient {
   private restRootCache?: string;
 
@@ -49,7 +53,6 @@ export class ConfluenceClient {
 
   async ping(): Promise<string> {
     const root = await this.ensureRestRoot();
-    // A lightweight endpoint that exists on both Cloud and DC/Server
     await this.rawCall("GET", `${root}/space?limit=1`);
     return root;
   }
@@ -57,15 +60,20 @@ export class ConfluenceClient {
   async searchPageByTitle(
     spaceKey: string,
     title: string,
+    parentPageId?: string,
   ): Promise<ConfluenceContent | null> {
     const root = await this.ensureRestRoot();
-    const q = `type=page AND space="${spaceKey}" AND title="${title.replace(/"/g, '\\"')}"`;
-    const url = `${root}/content/search?cql=${encodeURIComponent(q)}&limit=1`;
 
+    const escapedTitle = escapeCqlStringLiteral(title);
+    let q = `type=page AND space="${spaceKey}" AND title="${escapedTitle}"`;
+    if (parentPageId) q += ` AND ancestor=${parentPageId}`;
+
+    const url = `${root}/content/search?cql=${encodeURIComponent(q)}&limit=1`;
     const res = await this.rawCall("GET", url);
     const json = this.safeJson(res.text);
     const r = json?.results?.[0];
     if (!r?.id) return null;
+
     return {
       id: String(r.id),
       title: String(r.title ?? title),
@@ -88,9 +96,7 @@ export class ConfluenceClient {
       body: { storage: { value: storageValue, representation: "storage" } },
     };
 
-    if (parentPageId) {
-      body.ancestors = [{ id: parentPageId }];
-    }
+    if (parentPageId) body.ancestors = [{ id: parentPageId }];
 
     const res = await this.rawCall("POST", `${root}/content`, body);
     const json = this.safeJson(res.text);
@@ -110,7 +116,6 @@ export class ConfluenceClient {
   ): Promise<ConfluenceContent> {
     const root = await this.ensureRestRoot();
 
-    // Need current version
     const currentRes = await this.rawCall(
       "GET",
       `${root}/content/${pageId}?expand=version`,
@@ -137,13 +142,32 @@ export class ConfluenceClient {
     };
   }
 
-  /**
-   * Confluence Cloud attachments:
-   * PUT /wiki/rest/api/content/{id}/child/attachment
-   * Must include X-Atlassian-Token: nocheck for multipart/form-data.
-   *
-   * We use requestUrl + a manually-built multipart body to avoid CORS.
-   */
+  async getPage(pageId: string): Promise<any> {
+    const root = await this.ensureRestRoot();
+    const res = await requestUrl({
+      url: `${root}/content/${pageId}?expand=version,_links,ancestors,space`,
+      method: "GET",
+      headers: { Accept: "application/json", ...this.authHeaders() },
+      throw: false,
+    });
+
+    if (res.status >= 400) {
+      throw new Error(
+        `GET content/${pageId} failed: ${res.status} ${res.text}`,
+      );
+    }
+
+    // If HTML comes back (SSO/proxy), show it clearly
+    const t = (res.text ?? "").trimStart();
+    if (t.startsWith("<")) {
+      throw new Error(
+        `GET content/${pageId} returned HTML (login/proxy). First 200 chars: ${t.slice(0, 200)}`,
+      );
+    }
+
+    return JSON.parse(res.text);
+  }
+
   async uploadAttachment(
     pageId: string,
     filename: string,
@@ -151,6 +175,7 @@ export class ConfluenceClient {
   ): Promise<void> {
     const root = await this.ensureRestRoot();
     const url = `${root}/content/${pageId}/child/attachment`;
+
     const safeName = filename.replace(/[\r\n"]/g, "_");
     const boundary = `----WebKitFormBoundary${Math.random().toString(16).slice(2)}${Date.now()}`;
     const mime = this.guessMime(safeName);
@@ -171,9 +196,18 @@ export class ConfluenceClient {
     });
 
     if (res.status >= 400) {
-      // Now you'll finally see Atlassian's actual error message in res.text
-      throw new Error(`POST ${url} failed: ${res.status} ${res.text}`);
+      throw new Error(`PUT ${url} failed: ${res.status} ${res.text}`);
     }
+  }
+
+  async addLabels(pageId: string, labels: string[]): Promise<void> {
+    if (labels.length === 0) return;
+    const root = await this.ensureRestRoot();
+    const url = `${root}/content/${pageId}/label`;
+
+    const body = labels.map((name) => ({ prefix: "global", name }));
+
+    await this.rawCall("POST", url, body);
   }
 
   // ---------------------------
@@ -187,29 +221,22 @@ export class ConfluenceClient {
     const override = (this.cfg.restApiPathOverride ?? "").trim();
 
     if (override) {
-      // If they put full "/wiki/rest/api" or "/rest/api", honor it
       const rest = `${base}${ensureLeadingSlash(override)}`.replace(/\/+$/, "");
-      // Probe quickly
       await this.rawCall("GET", `${rest}/space?limit=1`);
       this.restRootCache = rest;
       return rest;
     }
 
-    // Candidate list
     const candidates: string[] = [];
 
-    // If base already includes /wiki, treat it as Cloud base and try /rest/api
     if (base.endsWith("/wiki")) {
       candidates.push(`${base}/rest/api`);
     } else {
-      // Cloud
       candidates.push(`${base}/wiki/rest/api`);
-      // Self-hosted common
       candidates.push(`${base}/rest/api`);
       candidates.push(`${base}/confluence/rest/api`);
     }
 
-    // Mode filtering
     const mode = this.cfg.mode;
     const filtered =
       mode === "cloud"
@@ -235,30 +262,6 @@ export class ConfluenceClient {
     );
   }
 
-  async addLabels(pageId: string, labels: string[]): Promise<void> {
-    if (labels.length === 0) return;
-    const root = await this.ensureRestRoot();
-    const url = `${root}/content/${pageId}/label`;
-
-    const body = labels.map((name) => ({ prefix: "global", name }));
-
-    const res = await requestUrl({
-      url,
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        ...this.authHeaders(),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      throw: false,
-    });
-
-    if (res.status >= 400) {
-      throw new Error(`POST ${url} failed: ${res.status} ${res.text}`);
-    }
-  }
-
   // ---------------------------
   // Low-level HTTP helpers
   // ---------------------------
@@ -269,7 +272,6 @@ export class ConfluenceClient {
       return token ? { Authorization: `Bearer ${token}` } : {};
     }
 
-    // basic
     const user = this.cfg.username ?? "";
     const pass = this.cfg.passwordOrToken ?? "";
     const encoded = btoa(`${user}:${pass}`);
@@ -281,21 +283,40 @@ export class ConfluenceClient {
     url: string,
     jsonBody?: any,
   ): Promise<RequestUrlResponse> {
-    // requestUrl bypasses CORS (good for Obsidian desktop)
+    const isWrite = method === "POST" || method === "PUT";
+
+    const headers: Record<string, string> = {
+      ...this.authHeaders(),
+      Accept: "application/json",
+    };
+
+    if (jsonBody) headers["Content-Type"] = "application/json";
+
+    if (isWrite) {
+      // XSRF bypass headers (some DC/proxy combos are picky)
+      headers["X-Atlassian-Token"] = "no-check";
+      headers["X-Requested-With"] = "XMLHttpRequest";
+      headers["Origin"] = "app://obsidian.md";
+      headers["Referer"] = this.cfg.baseUrl;
+    }
+
+    // Debug: confirm headers actually set (don’t log auth)
+    const debugHeaders = { ...headers };
+    delete (debugHeaders as any).Authorization;
+    console.log("[Confluence] rawCall", method, url, debugHeaders);
+
     const res = await requestUrl({
       url,
       method,
-      headers: {
-        ...this.authHeaders(),
-        Accept: "application/json",
-        ...(jsonBody ? { "Content-Type": "application/json" } : {}),
-      },
+      headers,
       body: jsonBody ? JSON.stringify(jsonBody) : undefined,
+      throw: false,
     });
 
     if (res.status >= 400) {
       throw new Error(`${method} ${url} failed: ${res.status} ${res.text}`);
     }
+
     return res;
   }
 
@@ -326,13 +347,6 @@ export class ConfluenceClient {
     }
   }
 
-  /**
-   * Builds a multipart/form-data body with:
-   *  - comment field
-   *  - file field
-   *
-   * Returns Uint8Array so requestUrl won't coerce it to string.
-   */
   private buildMultipartBody(
     filename: string,
     mime: string,
@@ -341,7 +355,6 @@ export class ConfluenceClient {
   ): Uint8Array {
     const enc = new TextEncoder();
 
-    // IMPORTANT: file field name must be exactly "file"
     const head =
       `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
@@ -364,25 +377,8 @@ export class ConfluenceClient {
     return out;
   }
 
-  async getPage(pageId: string) {
-    const root = await this.ensureRestRoot();
-    const res = await requestUrl({
-      url: `${root}/content/${pageId}?expand=version,_links`,
-      method: "GET",
-      headers: { Accept: "application/json", ...this.authHeaders() },
-      throw: false,
-    });
-
-    if (res.status >= 400)
-      throw new Error(
-        `GET content/${pageId} failed: ${res.status} ${res.text}`,
-      );
-    return JSON.parse(res.text);
-  }
-
   // Confluence returns _links.webui like "/spaces/KEY/pages/123/Title"
   toWebUrl(webuiPath: string): string {
-    // Derive site base from cfg.baseUrl
     const base = this.cfg.baseUrl.replace(/\/+$/, "");
     if (webuiPath.startsWith("http")) return webuiPath;
     return `${base}${webuiPath.startsWith("/") ? "" : "/"}${webuiPath}`;
