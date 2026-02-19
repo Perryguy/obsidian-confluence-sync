@@ -43,6 +43,14 @@ export class ConfluenceClient {
 
   constructor(private cfg: ConfluenceClientConfig) {}
 
+  /**
+   * Escape a string for safe inclusion inside a double-quoted CQL string literal.
+   * Escapes backslashes first, then double quotes.
+   */
+  private escapeCqlStringLiteral(value: string): string {
+    return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
   // ---------------------------
   // Public API used by exporter
   // ---------------------------
@@ -59,7 +67,7 @@ export class ConfluenceClient {
     title: string,
   ): Promise<ConfluenceContent | null> {
     const root = await this.ensureRestRoot();
-    const q = `type=page AND space="${spaceKey}" AND title="${title.replace(/"/g, '\\"')}"`;
+    const q = `type=page AND space="${spaceKey}" AND title="${this.escapeCqlStringLiteral(title)}"`;
     const url = `${root}/content/search?cql=${encodeURIComponent(q)}&limit=1`;
 
     const res = await this.rawCall("GET", url);
