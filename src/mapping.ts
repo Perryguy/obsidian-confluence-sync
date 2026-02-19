@@ -1,76 +1,59 @@
-import { App, TFile } from "obsidian";
-import type { MappingStore, MappingEntry } from "./types";
+import type { Plugin } from "obsidian";
 
-const DEFAULT_MAPPING: MappingStore = {
-  version: 1,
-  entries: {},
-};
+export interface MappingEntry {
+  filePath: string;
+  pageId: string;
+  title: string;
+  webui?: string;
+  updatedAt: string;
+}
+
+type MappingStore = Record<string, MappingEntry>;
 
 export class MappingService {
-  private store: MappingStore = { ...DEFAULT_MAPPING };
+  private store: MappingStore = {};
 
-  constructor(
-    private app: App,
-    private mappingFileName: string,
-  ) {}
-
-  getStore(): MappingStore {
-    return this.store;
-  }
-
-  get(filePath: string): MappingEntry | undefined {
-    return this.store.entries[filePath];
-  }
-
-  set(entry: MappingEntry): void {
-    this.store.entries[entry.filePath] = entry;
-  }
+  constructor(private plugin: Plugin) {}
 
   async load(): Promise<void> {
-    const path = this.mappingFileName;
-    const af = this.app.vault.getAbstractFileByPath(path);
+    const data = (await this.plugin.loadData()) ?? {};
+    const mapping = (data as any).mapping;
 
-    if (!af) {
-      await this.app.vault.create(
-        path,
-        JSON.stringify(DEFAULT_MAPPING, null, 2),
-      );
-      this.store = { ...DEFAULT_MAPPING };
-      return;
-    }
-
-    const file = af as TFile;
-    const text = await this.app.vault.read(file);
-    try {
-      this.store = JSON.parse(text) as MappingStore;
-      if (!this.store.version) this.store.version = 1;
-      if (!this.store.entries) this.store.entries = {};
-    } catch {
-      // If corrupted, do not destroy it automatically — just fall back in-memory
-      this.store = { ...DEFAULT_MAPPING };
+    if (mapping && typeof mapping === "object") {
+      this.store = mapping as MappingStore;
+    } else {
+      this.store = {};
     }
   }
 
   async save(): Promise<void> {
-    const path = this.mappingFileName;
-    const af = this.app.vault.getAbstractFileByPath(path);
+    const data = (await this.plugin.loadData()) ?? {};
 
-    const payload = JSON.stringify(this.store, null, 2);
+    // Preserve anything else stored in plugin data (including settings)
+    await this.plugin.saveData({
+      ...data,
+      mapping: this.store,
+    });
+  }
 
-    if (!af) {
-      await this.app.vault.create(path, payload);
-      return;
-    }
+  get(path: string): MappingEntry | undefined {
+    return this.store[path];
+  }
 
-    await this.app.vault.modify(af as TFile, payload);
+  set(entry: MappingEntry): void {
+    this.store[entry.filePath] = entry;
+  }
+
+  remove(path: string): void {
+    delete this.store[path];
   }
 
   async reset(): Promise<void> {
-    this.store = { version: 1, entries: {} };
+    this.store = {};
     await this.save();
   }
 
-  remove(filePath: string): void {
-    delete this.store.entries[filePath];
+  all(): MappingEntry[] {
+    return Object.values(this.store);
   }
 }

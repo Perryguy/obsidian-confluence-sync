@@ -22,8 +22,6 @@ export interface ConfluenceSettings {
   updateExisting: boolean;
   storeContentProperties: boolean;
 
-  mappingFileName: string; // e.g. confluence-mapping.json
-
   dryRun: boolean;
   childPagesUnderRoot: boolean;
   showProgressNotices: boolean;

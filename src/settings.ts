@@ -27,8 +27,6 @@ export const DEFAULT_SETTINGS: ConfluenceSettings = {
   updateExisting: true,
   storeContentProperties: true,
 
-  mappingFileName: "confluence-mapping.json",
-
   dryRun: false,
   childPagesUnderRoot: true,
   showProgressNotices: true,
