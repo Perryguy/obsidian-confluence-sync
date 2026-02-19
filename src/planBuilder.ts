@@ -22,8 +22,8 @@ export interface BuildPlanOptions {
 }
 
 function escapeCqlString(s: string): string {
-  // CQL string escaping for quotes
-  return s.replace(/"/g, '\\"');
+  // CQL string escaping for backslashes and quotes
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 export async function buildExportPlan(
