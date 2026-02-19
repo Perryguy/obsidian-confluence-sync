@@ -44,6 +44,37 @@ export default class ConfluenceSyncPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "confluence-sync-write-test",
+      name: "Confluence Sync: Write test (create page)",
+      callback: async () => {
+        try {
+          if (!this.settings.spaceKey) {
+            new Notice("Set Space Key first.");
+            return;
+          }
+
+          this.rebuildServices(); // if you have this helper; otherwise ensure client/mapping/exporter exist
+
+          const title = `Obsidian Write Test ${new Date().toISOString()}`;
+          const storage = `<p>Write test from Obsidian at ${new Date().toISOString()}</p>`;
+
+          const created = await this.client.createPage(
+            this.settings.spaceKey,
+            title,
+            this.settings.parentPageId || undefined,
+            storage,
+          );
+
+          new Notice(`Write OK. Created page id=${created.id}`);
+          console.log("[Confluence] Write test created:", created);
+        } catch (e: any) {
+          console.error(e);
+          new Notice(`Write test failed: ${e?.message ?? e}`);
+        }
+      },
+    });
+
+    this.addCommand({
       id: "confluence-sync-reset-mapping",
       name: "Confluence Sync: Reset mapping file",
       callback: async () => {
@@ -53,7 +84,9 @@ export default class ConfluenceSyncPlugin extends Plugin {
 
           await this.mapping.load();
           await this.mapping.reset();
-          new Notice("Confluence mapping reset. Next export will recreate pages.");
+          new Notice(
+            "Confluence mapping reset. Next export will recreate pages.",
+          );
         } catch (e: any) {
           console.error(e);
           new Notice(`Reset failed: ${e?.message ?? e}`);

@@ -1,18 +1,10 @@
 import { App, TFile, Notice } from "obsidian";
-import type { ConfluenceSettings, ExportMode } from "./types";
+import type { ConfluenceSettings } from "./types";
 import type { ConfluenceClient } from "./confluenceClient";
 import { ConfluenceStorageConverter } from "./confluenceStorageConverter";
 import type { MappingService } from "./mapping";
 
 export type ProgressFn = (text: string) => void;
-
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-function basenameTitle(file: TFile): string {
-  return file.basename;
-}
 
 // Cloud/selfhost safe base for UI URLs.
 // If API gives us a relative webui (preferred), we join it to base.
@@ -134,7 +126,6 @@ export class Exporter {
       return;
     }
 
-    // --- copy/paste your exportFromRoot body, replacing `ordered` usage ---
     // Pass 1 root first (if included)
     const rootIncluded = ordered.some((f) => f.path === root.path);
 
@@ -201,16 +192,13 @@ export class Exporter {
   }
 
   private getBacklinks(root: TFile): TFile[] {
-    // resolvedLinks: { [sourcePath: string]: { [destPath: string]: number } }
     const resolved = this.app.metadataCache.resolvedLinks;
     const out: TFile[] = [];
-
     const targetPath = root.path;
 
     for (const [srcPath, destMap] of Object.entries(resolved)) {
       if (!destMap || typeof destMap !== "object") continue;
 
-      // If src links to our target
       if (Object.prototype.hasOwnProperty.call(destMap, targetPath)) {
         const af = this.app.vault.getAbstractFileByPath(srcPath);
         if (af instanceof TFile && af.extension === "md") out.push(af);
@@ -289,7 +277,7 @@ export class Exporter {
 
     const mapped = this.mapping.get(file.path);
 
-    let pageId: string | null = null;
+    let pageId: string | undefined;
     let webui: string | undefined;
 
     // 1) Try mapped update
@@ -301,7 +289,6 @@ export class Exporter {
           storage,
         );
         pageId = updated.id;
-
         webui = updated._links?.webui;
       } catch (e: any) {
         const msg = String(e?.message ?? e);
@@ -339,6 +326,9 @@ export class Exporter {
       pageId = created.id;
       webui = created._links?.webui;
     }
+
+    // ✅ Guarantee pageId exists from here
+    if (!pageId) throw new Error(`Failed to resolve pageId for ${file.path}`);
 
     // 4) Save mapping
     this.mapping.set({
@@ -386,7 +376,6 @@ export class Exporter {
 
     const title = file.basename;
     const md = await this.app.vault.read(file);
-
     const storage = this.converter.convert(md, this.makeCtx(file));
 
     try {
@@ -421,13 +410,11 @@ export class Exporter {
         );
 
         if (dest instanceof TFile) {
-          // If it's a markdown note → link to page title
           if (dest.extension === "md") {
             const mapped = this.mapping.get(dest.path);
             return { title: mapped?.title ?? dest.basename };
           }
 
-          // If it's an asset (image) → return filename for <ri:attachment>
           return { title: dest.name };
         }
 
@@ -445,7 +432,6 @@ export class Exporter {
     out.push(rootFile);
     map.delete(root.path);
 
-    // keep stable-ish ordering by path
     for (const f of Array.from(map.values()).sort((a, b) =>
       a.path.localeCompare(b.path),
     )) {
