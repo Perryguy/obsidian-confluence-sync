@@ -1,6 +1,6 @@
 # Obsidian Confluence Sync
 
-Export a selected set of Obsidian notes to Confluence (Cloud or Server/DC), including links, attachments, callouts, and labels — with a review step before publishing.
+Publish Obsidian notes to Confluence Cloud or Server/Data Center with review, attachment sync, and tag-to-label support.
 
 ## Status
 
@@ -9,17 +9,22 @@ Recommended for testing and internal use.
 
 ## Features
 
-- Export current note + one of:
-  - Backlinks
-  - Outlinks
-  - Graph crawl (BFS depth)
-- Review export plan before publishing:
-  - Shows Create / Update / Recreate / Skip
-  - Deselect items or cancel export
-- Converts Obsidian Markdown to Confluence Storage format (HTML/macros)
-- Upload embedded images as attachments
+- Export current note + backlinks / outlinks / graph depth
+- Review export plan before publishing
+- Detect Create / Update / Recreate / Skip
+- Select/deselect items before export
 - Obsidian tags → Confluence labels
-- Callouts → Confluence styled callouts/panels (depending on config)
+- Upload embedded images as attachments
+- Automatic REST root detection (Cloud + Self-hosted)
+- Safe rename handling (mapping migration)
+- Two-pass export for correct link resolution
+
+## How It Works?
+
+- Pass 1: Create/update pages
+- Pass 2: Rewrite links
+
+Mapping stored in plugin data
 
 ## Non-goals (for now)
 
@@ -67,25 +72,40 @@ Settings → Community plugins → Obsidian Confluence Sync
 ## Usage
 
 ### Review export (recommended)
-- Command palette → **Export to Confluence (Review…)**
-- Review the plan, deselect items if needed
-- Click **Export selected**
+1. Open note
+2. Command palette → **Export to Confluence (Review…)**
+3. Select space
+4. (Optional) Choose parent page
+5. Review create/update/recreate
+6. Export selected
 
 ### Export without review
 - Command palette → **Confluence Sync: Export current + linked set**
+
+## Mapping System
+Mapping is stored in plugin data.
+It is not visible in your vault.
+It automatically updates on note rename.
 
 ## Known limitations
 
 - Attachments may create new versions on repeated export (improvements planned)
 - Task lists are currently exported as plain lists (native Confluence tasks planned)
 - Some markdown extensions may not convert perfectly
+- No comment syncing
+- No attachment deletion detection
+- No page move detection yet
+- Title collision detection still limited
 
 ## Roadmap
 
 - Attachment “skip unchanged” (hashing)
 - Native Confluence task list conversion
-- Conflict detection when mapping points to a different page than title-search
 - Dry run improvements + diff preview
+- Parent conflict detection
+- Page move detection
+- Better diff awareness
+- Incremental attachment sync
 
 ## Contributing
 
