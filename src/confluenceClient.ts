@@ -55,11 +55,14 @@ export class ConfluenceClient {
   async searchPageByTitle(
     spaceKey: string,
     title: string,
+    parentPageId?: string,
   ): Promise<ConfluenceContent | null> {
     const root = await this.ensureRestRoot();
-    const q = `type=page AND space="${spaceKey}" AND title="${title.replace(/"/g, '\\"')}"`;
-    const url = `${root}/content/search?cql=${encodeURIComponent(q)}&limit=1`;
 
+    let q = `type=page AND space="${spaceKey}" AND title="${title.replace(/"/g, '\\"')}"`;
+    if (parentPageId) q += ` AND ancestor=${parentPageId}`;
+
+    const url = `${root}/content/search?cql=${encodeURIComponent(q)}&limit=1`;
     const res = await this.rawCall("GET", url);
     const json = this.safeJson(res.text);
     const r = json?.results?.[0];
@@ -133,6 +136,32 @@ export class ConfluenceClient {
     };
   }
 
+  async getPage(pageId: string): Promise<any> {
+    const root = await this.ensureRestRoot();
+    const res = await requestUrl({
+      url: `${root}/content/${pageId}?expand=version,_links,ancestors,space`,
+      method: "GET",
+      headers: { Accept: "application/json", ...this.authHeaders() },
+      throw: false,
+    });
+
+    if (res.status >= 400) {
+      throw new Error(
+        `GET content/${pageId} failed: ${res.status} ${res.text}`,
+      );
+    }
+
+    // If HTML comes back (SSO/proxy), show it clearly
+    const t = (res.text ?? "").trimStart();
+    if (t.startsWith("<")) {
+      throw new Error(
+        `GET content/${pageId} returned HTML (login/proxy). First 200 chars: ${t.slice(0, 200)}`,
+      );
+    }
+
+    return JSON.parse(res.text);
+  }
+
   async uploadAttachment(
     pageId: string,
     filename: string,
@@ -169,22 +198,10 @@ export class ConfluenceClient {
     if (labels.length === 0) return;
     const root = await this.ensureRestRoot();
     const url = `${root}/content/${pageId}/label`;
+
     const body = labels.map((name) => ({ prefix: "global", name }));
 
-    const res = await requestUrl({
-      url,
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        ...this.authHeaders(),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      throw: false,
-    });
-
-    if (res.status >= 400)
-      throw new Error(`POST ${url} failed: ${res.status} ${res.text}`);
+    await this.rawCall("POST", url, body);
   }
 
   // ---------------------------
@@ -260,21 +277,40 @@ export class ConfluenceClient {
     url: string,
     jsonBody?: any,
   ): Promise<RequestUrlResponse> {
+    const isWrite = method === "POST" || method === "PUT";
+
+    const headers: Record<string, string> = {
+      ...this.authHeaders(),
+      Accept: "application/json",
+    };
+
+    if (jsonBody) headers["Content-Type"] = "application/json";
+
+    if (isWrite) {
+      // XSRF bypass headers (some DC/proxy combos are picky)
+      headers["X-Atlassian-Token"] = "no-check";
+      headers["X-Requested-With"] = "XMLHttpRequest";
+      headers["Origin"] = "app://obsidian.md";
+      headers["Referer"] = this.cfg.baseUrl;
+    }
+
+    // Debug: confirm headers actually set (don’t log auth)
+    const debugHeaders = { ...headers };
+    delete (debugHeaders as any).Authorization;
+    console.log("[Confluence] rawCall", method, url, debugHeaders);
+
     const res = await requestUrl({
       url,
       method,
-      headers: {
-        ...this.authHeaders(),
-        Accept: "application/json",
-        ...(jsonBody ? { "Content-Type": "application/json" } : {}),
-      },
+      headers,
       body: jsonBody ? JSON.stringify(jsonBody) : undefined,
-      throw: false, // ✅ critical to see server error body
+      throw: false,
     });
 
     if (res.status >= 400) {
       throw new Error(`${method} ${url} failed: ${res.status} ${res.text}`);
     }
+
     return res;
   }
 
