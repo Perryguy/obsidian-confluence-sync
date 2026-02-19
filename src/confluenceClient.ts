@@ -37,6 +37,11 @@ function ensureLeadingSlash(s: string): string {
   return s.startsWith("/") ? s : `/${s}`;
 }
 
+function escapeCqlStringLiteral(value: string): string {
+  // Escape backslashes first, then double quotes, to avoid creating unescaped quotes.
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 export class ConfluenceClient {
   private restRootCache?: string;
 
@@ -59,7 +64,8 @@ export class ConfluenceClient {
   ): Promise<ConfluenceContent | null> {
     const root = await this.ensureRestRoot();
 
-    let q = `type=page AND space="${spaceKey}" AND title="${title.replace(/"/g, '\\"')}"`;
+    const escapedTitle = escapeCqlStringLiteral(title);
+    let q = `type=page AND space="${spaceKey}" AND title="${escapedTitle}"`;
     if (parentPageId) q += ` AND ancestor=${parentPageId}`;
 
     const url = `${root}/content/search?cql=${encodeURIComponent(q)}&limit=1`;
