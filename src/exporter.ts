@@ -1,13 +1,23 @@
 // src/exporter.ts
 import { App, TFile, Notice } from "obsidian";
-import type { ConfluenceSettings } from "./types";
+import type {
+  ConfluenceSettings,
+  HierarchyMode,
+  ManyToManyPolicy,
+} from "./types";
 import type { ConfluenceClient } from "./confluenceClient";
 import { ConfluenceStorageConverter } from "./confluenceStorageConverter";
 import type { MappingService } from "./mapping";
 import { SnapshotService } from "./snapshots";
 import { normaliseStorage } from "./storageNormalise";
+import { buildHierarchy } from "./hierarchy";
 
 export type ProgressFn = (text: string) => void;
+
+export type HierarchyRunOptions = {
+  hierarchyMode?: HierarchyMode;
+  hierarchyManyToManyPolicy?: ManyToManyPolicy;
+};
 
 export class Exporter {
   private converter = new ConfluenceStorageConverter();
@@ -29,13 +39,13 @@ export class Exporter {
   /**
    * Returns markdown that is safe/clean to publish:
    * - removes YAML frontmatter block
-   * - strips inline Obsidian tags (#foo, #foo/bar) from text
-   * - DOES NOT touch code blocks / inline code
+   * - strips inline Obsidian tags (#foo, #foo/bar) from body text
+   * - DOES NOT touch fenced code blocks / inline code
    */
   private toPublishMarkdown(markdown: string): string {
     if (!markdown) return "";
 
-    // 1) Remove frontmatter (prevents it showing up as body text)
+    // 1) Remove frontmatter
     let s = markdown.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "");
 
     // 2) Protect fenced code blocks + inline code
@@ -54,7 +64,7 @@ export class Exporter {
     });
 
     // 3) Strip inline tags (avoid headings by requiring whitespace or '(' before '#')
-    // Keep the leading delimiter (group 1) so we don't glue words together.
+    // Keep group 1 to avoid gluing words.
     s = s.replace(/(^|[\s(])#([A-Za-z0-9/_-]+)\b/gm, "$1");
 
     // 4) Restore holes
@@ -63,7 +73,7 @@ export class Exporter {
       return Number.isFinite(i) ? (holes[i] ?? "") : "";
     });
 
-    // 5) Tidy: collapse trailing whitespace
+    // 5) Normalise line endings & trim trailing whitespace
     s = s
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
@@ -75,11 +85,57 @@ export class Exporter {
     return s;
   }
 
+  // -----------------------------------------
+  // Public API
+  // -----------------------------------------
   async exportFromRoot(root: TFile): Promise<void> {
+    return this.exportInternal(root, undefined, undefined);
+  }
+
+  public async collectExportSet(
+    root: TFile,
+    opts?: HierarchyRunOptions,
+  ): Promise<TFile[]> {
+    await this.mapping.load();
+    const files = await this.buildExportSet(root);
+
+    const { ordered } = this.computeHierarchyAndOrder(root, files, opts);
+    return ordered;
+  }
+
+  public async exportFromRootSelected(
+    root: TFile,
+    selectedPaths: Set<string>,
+    opts?: HierarchyRunOptions,
+  ): Promise<void> {
+    return this.exportInternal(root, selectedPaths, opts);
+  }
+
+  // -----------------------------------------
+  // Core export routine (shared)
+  // -----------------------------------------
+  private async exportInternal(
+    root: TFile,
+    selectedPaths?: Set<string>,
+    opts?: HierarchyRunOptions,
+  ): Promise<void> {
     await this.mapping.load();
 
     const files = await this.buildExportSet(root);
-    const ordered = this.orderRootFirst(root, files);
+    const filtered = selectedPaths
+      ? files.filter((f) => selectedPaths.has(f.path))
+      : files;
+
+    // If the user deselects the root, we still need a sensible root for hierarchy.
+    // Best behavior: if root is not included, we treat the provided `root` as
+    // the conceptual root but only export the selected subset.
+    const inSet = this.ensureRootPresent(root, filtered);
+
+    const { ordered, parentByPath } = this.computeHierarchyAndOrder(
+      root,
+      inSet,
+      opts,
+    );
 
     if (ordered.length === 0) {
       new Notice("Nothing to export.");
@@ -98,29 +154,47 @@ export class Exporter {
         new Notice(`Confluence: exporting ${ordered.length} note(s)…`);
     }
 
-    this.progress(`Confluence: Pass 1/2 (root) ${root.basename}`);
-    await this.ensurePageForFile(root, undefined);
-    await this.mapping.save();
+    const rootParent = this.settings.parentPageId || undefined;
 
-    const rootEntry = this.mapping.get(root.path);
-    const rootPageId = rootEntry?.pageId;
-
-    const parentOverride =
-      this.settings.childPagesUnderRoot && rootPageId
-        ? rootPageId
-        : this.settings.parentPageId || undefined;
-
+    // -----------------------------
+    // Pass 1: ensure pages exist (in hierarchy-safe order)
+    // -----------------------------
     let idx = 0;
-    const totalOthers = Math.max(0, ordered.length - 1);
-
     for (const f of ordered) {
-      if (f.path === root.path) continue;
       idx++;
-
       this.progress(
-        `Confluence: Pass 1/2 (${idx}/${totalOthers}) ${f.basename}`,
+        `Confluence: Pass 1/2 (${idx}/${ordered.length}) ${f.basename}`,
       );
-      await this.ensurePageForFile(f, parentOverride);
+
+      const isRoot = f.path === root.path;
+
+      // Compute desired parent pageId for this file.
+      // We decide in terms of file parent path, then map to Confluence pageId (from mapping).
+      let parentIdOverride: string | undefined;
+
+      if (isRoot) {
+        parentIdOverride = rootParent;
+      } else {
+        const parentPath = parentByPath.get(f.path) ?? root.path;
+
+        // FLAT mode legacy behavior: either under root page or under settings parent
+        // (This keeps your existing semantics when hierarchyMode is "flat".)
+        if (this.getHierarchyMode(opts) === "flat") {
+          const rootEntry = this.mapping.get(root.path);
+          const rootPageId = rootEntry?.pageId;
+
+          parentIdOverride =
+            this.settings.childPagesUnderRoot && rootPageId
+              ? rootPageId
+              : rootParent;
+        } else {
+          const parentEntry = this.mapping.get(parentPath);
+          const parentPageId = parentEntry?.pageId;
+          parentIdOverride = parentPageId ?? rootParent;
+        }
+      }
+
+      await this.ensurePageForFile(f, parentIdOverride);
 
       if (idx % 5 === 0) await this.mapping.save();
     }
@@ -133,79 +207,9 @@ export class Exporter {
       return;
     }
 
-    let j = 0;
-    const total = ordered.length;
-
-    for (const f of ordered) {
-      j++;
-      this.progress(`Confluence: Pass 2/2 (${j}/${total}) ${f.basename}`);
-      await this.updatePageContentWithLinks(f);
-    }
-
-    await this.mapping.save();
-    this.progress("Confluence: export complete");
-    if (this.settings.showProgressNotices)
-      new Notice("Confluence export complete.");
-  }
-
-  public async collectExportSet(root: TFile): Promise<TFile[]> {
-    await this.mapping.load();
-    const files = await this.buildExportSet(root);
-    return this.orderRootFirst(root, files);
-  }
-
-  public async exportFromRootSelected(
-    root: TFile,
-    selectedPaths: Set<string>,
-  ): Promise<void> {
-    await this.mapping.load();
-
-    const files = await this.buildExportSet(root);
-    const ordered = this.orderRootFirst(root, files).filter((f) =>
-      selectedPaths.has(f.path),
-    );
-
-    if (ordered.length === 0) {
-      new Notice("Nothing selected to export.");
-      return;
-    }
-
-    const rootIncluded = ordered.some((f) => f.path === root.path);
-
-    if (rootIncluded) {
-      this.progress(`Confluence: Pass 1/2 (root) ${root.basename}`);
-      await this.ensurePageForFile(root, undefined);
-      await this.mapping.save();
-    }
-
-    const rootEntry = this.mapping.get(root.path);
-    const rootPageId = rootEntry?.pageId;
-
-    const parentOverride =
-      this.settings.childPagesUnderRoot && rootPageId
-        ? rootPageId
-        : this.settings.parentPageId || undefined;
-
-    let idx = 0;
-    const others = ordered.filter((f) => f.path !== root.path);
-
-    for (const f of others) {
-      idx++;
-      this.progress(
-        `Confluence: Pass 1/2 (${idx}/${others.length}) ${f.basename}`,
-      );
-      await this.ensurePageForFile(f, parentOverride);
-      if (idx % 5 === 0) await this.mapping.save();
-    }
-
-    await this.mapping.save();
-
-    if (this.settings.dryRun) {
-      this.progress(`Confluence: DRY RUN complete (${ordered.length} notes)`);
-      if (this.settings.showProgressNotices) new Notice("Dry run complete.");
-      return;
-    }
-
+    // -----------------------------
+    // Pass 2: update storage content now that mappings exist for link resolution
+    // -----------------------------
     let j = 0;
     for (const f of ordered) {
       j++;
@@ -221,9 +225,9 @@ export class Exporter {
       new Notice("Confluence export complete.");
   }
 
-  // -----------------------------
+  // -----------------------------------------
   // Export set discovery
-  // -----------------------------
+  // -----------------------------------------
   private async buildExportSet(root: TFile): Promise<TFile[]> {
     const mode = this.settings.exportMode;
     if (mode === "backlinks")
@@ -306,16 +310,16 @@ export class Exporter {
     return out;
   }
 
-  // -----------------------------
+  // -----------------------------------------
   // Pass 1: ensure page exists
-  // -----------------------------
+  // -----------------------------------------
   private async ensurePageForFile(
     file: TFile,
     parentIdOverride?: string,
   ): Promise<void> {
     const title = file.basename;
 
-    // Read original markdown (for tag extraction)
+    // Read original markdown (for tag extraction + embeds)
     const mdOriginal = await this.app.vault.read(file);
 
     // Clean markdown for publishing (removes inline #tags + frontmatter)
@@ -387,8 +391,7 @@ export class Exporter {
       updatedAt: new Date().toISOString(),
     });
 
-    // ✅ Write snapshots in pass 1 (so diffs work immediately on next plan build)
-    // NOTE: markdown snapshot stores "published markdown" (what Confluence received)
+    // Snapshots (markdown snapshot stores "published markdown" sent to Confluence)
     if (!this.settings.dryRun) {
       try {
         await this.snapshots.writeSnapshot(file.path, mdPublish);
@@ -409,7 +412,7 @@ export class Exporter {
       }
     }
 
-    // Labels from ORIGINAL markdown (so you still get inline tags / frontmatter tags as labels)
+    // Labels from ORIGINAL markdown (so inline tags/frontmatter still become labels)
     try {
       const { extractObsidianTags, toConfluenceLabel } = await import("./tags");
       const tags = extractObsidianTags(mdOriginal)
@@ -421,6 +424,7 @@ export class Exporter {
       new Notice(`Label sync failed for "${title}": ${e?.message ?? e}`);
     }
 
+    // Upload embeds (use original markdown so we see the embeds)
     try {
       await this.uploadEmbedsForPage(file, pageId);
     } catch (e: any) {
@@ -438,9 +442,9 @@ export class Exporter {
     await uploadEmbeddedImages(this.app, this.client, pageId, file, md);
   }
 
-  // -----------------------------
+  // -----------------------------------------
   // Pass 2: update content + title
-  // -----------------------------
+  // -----------------------------------------
   private async updatePageContentWithLinks(file: TFile): Promise<void> {
     const entry = this.mapping.get(file.path);
     if (!entry?.pageId) return;
@@ -484,13 +488,12 @@ export class Exporter {
 
     const bodyUnchanged =
       (baselineStorageNorm ?? existingStorageNorm) === newStorageNorm;
-
     const titleUnchanged = (existingTitle || "").trim() === desiredTitle.trim();
 
     if (bodyUnchanged && titleUnchanged) {
       console.log(`[Confluence] Skipping update (no changes): ${file.path}`);
 
-      // ✅ Still refresh snapshots so plan diffs stay correct
+      // Still refresh snapshots so plan diffs stay correct
       try {
         await this.snapshots.writeSnapshot(file.path, mdPublish);
       } catch (e: any) {
@@ -515,7 +518,6 @@ export class Exporter {
     try {
       await this.client.updatePage(entry.pageId, desiredTitle, newStorageRaw);
 
-      // Snapshot best-effort
       try {
         await this.snapshots.writeSnapshot(file.path, mdPublish);
       } catch (e: any) {
@@ -552,6 +554,9 @@ export class Exporter {
     });
   }
 
+  // -----------------------------------------
+  // Link resolution context for converter
+  // -----------------------------------------
   private makeCtx(file: TFile) {
     return {
       spaceKey: this.settings.spaceKey,
@@ -575,20 +580,93 @@ export class Exporter {
     };
   }
 
-  private orderRootFirst(root: TFile, files: TFile[]): TFile[] {
-    const map = new Map<string, TFile>();
-    for (const f of files) map.set(f.path, f);
+  // -----------------------------------------
+  // Hierarchy helpers (ordering + opts)
+  // -----------------------------------------
+  private getHierarchyMode(opts?: HierarchyRunOptions): HierarchyMode {
+    return (
+      opts?.hierarchyMode ?? (this.settings as any).hierarchyMode ?? "flat"
+    );
+  }
+
+  private getManyToManyPolicy(opts?: HierarchyRunOptions): ManyToManyPolicy {
+    return (
+      opts?.hierarchyManyToManyPolicy ??
+      (this.settings as any).hierarchyManyToManyPolicy ??
+      "firstSeen"
+    );
+  }
+
+  private computeHierarchyAndOrder(
+    root: TFile,
+    files: TFile[],
+    opts?: HierarchyRunOptions,
+  ): { ordered: TFile[]; parentByPath: Map<string, string | null> } {
+    const mode = this.getHierarchyMode(opts);
+    const policy = this.getManyToManyPolicy(opts);
+
+    const hier = buildHierarchy(this.app, root, files, mode, policy);
+    const parentByPath = hier.parentPathByPath;
+
+    // Deterministic ordering:
+    // - Topologically by parent/child
+    // - Stable sorting by path within a parent
+    const ordered = this.orderByParentMap(root, files, parentByPath);
+
+    return { ordered, parentByPath };
+  }
+
+  private orderByParentMap(
+    root: TFile,
+    files: TFile[],
+    parentByPath: Map<string, string | null>,
+  ): TFile[] {
+    const fileByPath = new Map<string, TFile>();
+    for (const f of files) fileByPath.set(f.path, f);
+
+    // children[parent] = [child...]
+    const children = new Map<string, string[]>();
+    for (const f of files) {
+      const child = f.path;
+      const parent = parentByPath.get(child);
+
+      if (parent == null) continue; // top-level (root)
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent)!.push(child);
+    }
+
+    // sort children lists for determinism
+    for (const arr of children.values()) arr.sort((a, b) => a.localeCompare(b));
 
     const out: TFile[] = [];
-    const rootFile = map.get(root.path) ?? root;
-    out.push(rootFile);
-    map.delete(root.path);
+    const visited = new Set<string>();
 
-    for (const f of Array.from(map.values()).sort((a, b) =>
-      a.path.localeCompare(b.path),
-    )) {
-      out.push(f);
-    }
+    const walk = (path: string) => {
+      if (visited.has(path)) return;
+      visited.add(path);
+
+      const f = fileByPath.get(path);
+      if (f) out.push(f);
+
+      const kids = children.get(path) ?? [];
+      for (const k of kids) walk(k);
+    };
+
+    // Always start with root if present
+    if (fileByPath.has(root.path)) walk(root.path);
+
+    // Then any disconnected nodes (shouldn’t happen often, but safe)
+    const remaining = Array.from(fileByPath.keys()).filter(
+      (p) => !visited.has(p),
+    );
+    remaining.sort((a, b) => a.localeCompare(b));
+    for (const p of remaining) walk(p);
+
     return out;
+  }
+
+  private ensureRootPresent(root: TFile, files: TFile[]): TFile[] {
+    const hasRoot = files.some((f) => f.path === root.path);
+    return hasRoot ? files : [root, ...files];
   }
 }

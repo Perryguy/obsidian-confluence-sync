@@ -1,45 +1,34 @@
-// src/exportPlan.ts
 export type PlanAction = "create" | "update" | "recreate" | "skip" | "conflict";
 
 export interface ExportPlanItem {
   filePath: string;
   title: string;
-
   selected: boolean;
 
-  /** Suggested action from plan builder */
   action: PlanAction;
-
-  /** Optional user override from the UI */
   overrideAction?: PlanAction;
+  reason: string;
 
-  /** Target Confluence page (if known) */
   pageId?: string;
   webui?: string;
 
-  /** If conflict, this is the conflicting page found in space (but not under parent) */
-  conflictPageId?: string;
-  conflictWebui?: string;
+  existingTitle?: string;
+  titleChanged?: boolean;
 
-  /** Human-readable reason for the suggested action */
-  reason: string;
-
-  /** Snapshot awareness */
-  hasSnapshot?: boolean;
-
-  /** Diff availability */
-  hasDiff?: boolean;
-
-  /** For review diff */
+  hasSnapshot: boolean;
+  hasDiff: boolean;
   diffOld?: string;
   diffNew?: string;
 
-  /** title awareness */
-  titleChanged?: boolean;
-  existingTitle?: string;
+  // Hierarchy
+  intendedParentFilePath?: string | null; // for preview
+  intendedParentPageId?: string | null; // used when creating/moving
+  depth?: number; // for UI indent
+
+  conflictPageId?: string;
+  conflictWebui?: string;
 }
 
-/** Effective action after applying override */
-export function effectiveAction(item: ExportPlanItem): PlanAction {
-  return item.overrideAction ?? item.action;
+export function effectiveAction(i: ExportPlanItem): PlanAction {
+  return (i.overrideAction ?? i.action) as PlanAction;
 }

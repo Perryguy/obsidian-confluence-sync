@@ -1,3 +1,4 @@
+// src/settings.ts
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type { ConfluenceSettings, ExportMode } from "./types";
 
@@ -30,6 +31,11 @@ export const DEFAULT_SETTINGS: ConfluenceSettings = {
   dryRun: false,
   childPagesUnderRoot: true,
   showProgressNotices: true,
+
+  // Defaults only — will be overridden per export in Review
+  hierarchyMode: "flat",
+  hierarchyManyToManyPolicy: "closestToRoot",
+  movePagesToMatchHierarchy: false,
 };
 
 export class ConfluenceSettingTab extends PluginSettingTab {
@@ -142,11 +148,7 @@ export class ConfluenceSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Space Key")
-      .setDesc(
-        "Space Key (not the space name). Example: ENG.\n" +
-          "Cloud URL: https://site.atlassian.net/wiki/spaces/ENG/pages/...\n" +
-          "Self-hosted URL: https://confluence.company.com/spaces/ENG/...",
-      )
+      .setDesc("Space Key (not the space name). Example: ENG.")
       .addText((t: any) =>
         t
           .setValue(this.plugin.settings.spaceKey)
@@ -212,7 +214,7 @@ export class ConfluenceSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Dry run")
       .setDesc(
-        "If enabled, the plugin will calculate what would be exported but will not create/update anything in Confluence.",
+        "If enabled, the plugin will calculate what would be exported but will not create/update anything.",
       )
       .addToggle((t: any) =>
         t.setValue(this.plugin.settings.dryRun).onChange(async (v: boolean) => {
@@ -223,9 +225,7 @@ export class ConfluenceSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Create linked pages under root page")
-      .setDesc(
-        "If enabled, pages in the export set (except the root note) are created as children of the root exported page.",
-      )
+      .setDesc("Applies when Hierarchy = Flat (legacy behaviour).")
       .addToggle((t: any) =>
         t
           .setValue(this.plugin.settings.childPagesUnderRoot)
@@ -246,5 +246,11 @@ export class ConfluenceSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    containerEl.createEl("hr");
+    containerEl.createEl("p", {
+      text: "Hierarchy is chosen per export in the Review screen so you can preview and avoid surprises.",
+      cls: "confluence-muted",
+    });
   }
 }

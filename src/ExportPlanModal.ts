@@ -2,15 +2,20 @@
 import { App, Modal, Setting, Notice } from "obsidian";
 import type { ExportPlanItem, PlanAction } from "./exportPlan";
 import { effectiveAction } from "./exportPlan";
+import type { HierarchyMode, ManyToManyPolicy } from "./types";
 
 export interface ExportReviewContext {
   spaceKey: string;
   parentPageId?: string;
+
+  // ✅ per-export hierarchy choices
+  hierarchyMode: HierarchyMode;
+  hierarchyManyToManyPolicy: ManyToManyPolicy;
 }
 
 export type RebuildPlanFn = (
   ctx: ExportReviewContext,
-) => Promise<ExportPlanItem[]>;
+) => Promise<{ items: ExportPlanItem[]; hierarchyPreviewLines: string[] }>;
 
 function extractPageIdFromInput(raw: string): string | undefined {
   const s = (raw ?? "").trim();
@@ -35,6 +40,8 @@ function extractPageIdFromInput(raw: string): string | undefined {
 
 export class ExportPlanModal extends Modal {
   private items: ExportPlanItem[];
+  private hierarchyPreviewLines: string[] = [];
+
   private onConfirm: (
     selected: ExportPlanItem[],
     ctx: ExportReviewContext,
@@ -45,7 +52,7 @@ export class ExportPlanModal extends Modal {
 
   constructor(
     app: App,
-    initialItems: ExportPlanItem[],
+    initial: { items: ExportPlanItem[]; hierarchyPreviewLines: string[] },
     initialCtx: ExportReviewContext,
     rebuildPlan: RebuildPlanFn,
     onConfirm: (
@@ -54,7 +61,8 @@ export class ExportPlanModal extends Modal {
     ) => Promise<void> | void,
   ) {
     super(app);
-    this.items = initialItems;
+    this.items = initial.items;
+    this.hierarchyPreviewLines = initial.hierarchyPreviewLines ?? [];
     this.ctx = { ...initialCtx };
     this.rebuildPlan = rebuildPlan;
     this.onConfirm = onConfirm;
@@ -91,9 +99,7 @@ export class ExportPlanModal extends Modal {
 
     new Setting(contentEl)
       .setName("Parent Page (optional)")
-      .setDesc(
-        "Paste a Parent Page ID or a Confluence page URL. If set, plan can detect conflicts under this parent.",
-      )
+      .setDesc("Paste a Parent Page ID or a Confluence page URL.")
       .addText((t) =>
         t
           .setPlaceholder("Page ID or URL")
@@ -102,6 +108,41 @@ export class ExportPlanModal extends Modal {
             this.ctx.parentPageId = extractPageIdFromInput(v);
           }),
       );
+
+    contentEl.createEl("hr");
+
+    // ---------- Hierarchy ----------
+    contentEl.createEl("h3", { text: "Hierarchy (optional)" });
+
+    new Setting(contentEl)
+      .setName("Hierarchy mode")
+      .setDesc("How child pages should be organised under the root.")
+      .addDropdown((d) => {
+        d.addOption("flat", "Flat (current behaviour)");
+        d.addOption("links", "Links (first linked page becomes parent)");
+        d.addOption("folder", "Folder (index.md / folder name note)");
+        d.addOption("frontmatter", "Frontmatter (parent: ...)");
+        d.addOption("hybrid", "Hybrid (folder, then links)");
+        d.setValue(this.ctx.hierarchyMode);
+        d.onChange((v) => {
+          this.ctx.hierarchyMode = v as HierarchyMode;
+        });
+      });
+
+    new Setting(contentEl)
+      .setName("Many-to-many policy")
+      .setDesc(
+        "When a note could belong under multiple parents, choose a deterministic policy.",
+      )
+      .addDropdown((d) => {
+        d.addOption("firstSeen", "First seen");
+        d.addOption("closestToRoot", "Closest to root");
+        d.addOption("preferFolderIndex", "Prefer folder index");
+        d.setValue(this.ctx.hierarchyManyToManyPolicy);
+        d.onChange((v) => {
+          this.ctx.hierarchyManyToManyPolicy = v as ManyToManyPolicy;
+        });
+      });
 
     new Setting(contentEl).addButton((b) =>
       b
@@ -112,9 +153,12 @@ export class ExportPlanModal extends Modal {
             const loading = contentEl.createEl("p", {
               text: "Rebuilding plan…",
             });
-            const newItems = await this.rebuildPlan(this.ctx);
+
+            const next = await this.rebuildPlan(this.ctx);
             loading.remove();
-            this.items = newItems;
+
+            this.items = next.items;
+            this.hierarchyPreviewLines = next.hierarchyPreviewLines ?? [];
             this.render();
           } catch (e: any) {
             console.error(e);
@@ -122,6 +166,15 @@ export class ExportPlanModal extends Modal {
           }
         }),
     );
+
+    // Preview
+    if (this.hierarchyPreviewLines.length > 0) {
+      const box = contentEl.createDiv({ cls: "confluence-hierarchy-preview" });
+      box.createEl("div", { text: "Preview:", cls: "confluence-muted" });
+
+      const pre = box.createEl("pre", { cls: "confluence-pre" });
+      pre.setText(this.hierarchyPreviewLines.join("\n"));
+    }
 
     contentEl.createEl("hr");
 
@@ -172,7 +225,6 @@ export class ExportPlanModal extends Modal {
     // ---------- Items ----------
     for (const item of this.items) {
       const row = contentEl.createDiv({ cls: "confluence-export-row" });
-
       const top = row.createDiv({ cls: "confluence-export-row-top" });
 
       const cb = top.createEl("input", { type: "checkbox" });
@@ -207,7 +259,6 @@ export class ExportPlanModal extends Modal {
         a.rel = "noopener";
       }
 
-      // ✅ Diff button for update/recreate (uses precomputed diffOld/diffNew from planBuilder)
       if ((eff === "update" || eff === "recreate") && item.hasDiff) {
         const diffBtn = details.createEl("button", { text: "Diff" });
         diffBtn.onclick = async () => {
@@ -216,17 +267,10 @@ export class ExportPlanModal extends Modal {
           const oldText = item.diffOld ?? "";
           const newText = item.diffNew ?? "";
 
-          // If we have no baseline, show a friendly header in "old" so it's obvious
-          const oldForUi =
-            oldText.trim().length === 0
-              ? "⟵ No previous markdown snapshot for this note.\nThis is the current content:\n"
-              : oldText;
-
-          new DiffModal(this.app, item.title, oldForUi, newText).open();
+          new DiffModal(this.app, item.title, oldText, newText).open();
         };
       }
 
-      // Conflict UI (if you have conflict logic in ExportPlanItem)
       if (eff === "conflict") {
         details.createEl("div", {
           text: "Conflict detected:",
@@ -259,7 +303,6 @@ export class ExportPlanModal extends Modal {
             d.setValue(item.overrideAction ?? "");
             d.onChange((v) => {
               item.overrideAction = (v || undefined) as PlanAction | undefined;
-
               const eff2 = effectiveAction(item);
               item.selected = eff2 !== "skip" && eff2 !== "conflict";
               this.render();

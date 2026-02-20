@@ -5,6 +5,8 @@ import type { ExportPlanItem } from "./exportPlan";
 import { ConfluenceStorageConverter } from "./confluenceStorageConverter";
 import { normaliseStorage } from "./storageNormalise";
 import { SnapshotService } from "./snapshots";
+import { buildHierarchy } from "./hierarchy";
+import type { HierarchyMode, ManyToManyPolicy } from "./types";
 
 export interface PlanBuilderDeps {
   app: App;
@@ -19,62 +21,41 @@ export interface PlanBuilderDeps {
   };
 }
 
+export interface ExportReviewContext {
+  spaceKey: string;
+  parentPageId?: string;
+
+  hierarchyMode: HierarchyMode;
+  hierarchyManyToManyPolicy: ManyToManyPolicy;
+}
+
 function normaliseTextForDiff(t: string): string {
-  // Prevent "everything changed" due to CRLF vs LF or trailing whitespace.
   return (t ?? "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
     .split("\n")
     .map((l) => l.replace(/[ \t]+$/g, ""))
-    .join("\n")
-    .trim();
-}
-
-/**
- * Must match Exporter.toPublishMarkdown() behaviour (so plan === publish).
- * - removes YAML frontmatter
- * - strips inline #tags (not in code blocks / inline code)
- */
-function toPublishMarkdown(markdown: string): string {
-  if (!markdown) return "";
-
-  let s = markdown.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "");
-
-  const holes: string[] = [];
-  s = s.replace(/```[\s\S]*?```/g, (m) => {
-    holes.push(m);
-    return `@@HOLE_${holes.length - 1}@@`;
-  });
-  s = s.replace(/~~~[\s\S]*?~~~/g, (m) => {
-    holes.push(m);
-    return `@@HOLE_${holes.length - 1}@@`;
-  });
-  s = s.replace(/`[^`]*`/g, (m) => {
-    holes.push(m);
-    return `@@HOLE_${holes.length - 1}@@`;
-  });
-
-  s = s.replace(/(^|[\s(])#([A-Za-z0-9/_-]+)\b/gm, "$1");
-
-  s = s.replace(/@@HOLE_(\d+)@@/g, (_m, idx) => {
-    const i = Number(idx);
-    return Number.isFinite(i) ? (holes[i] ?? "") : "";
-  });
-
-  return normaliseTextForDiff(s);
+    .join("\n");
 }
 
 export async function buildExportPlan(
   deps: PlanBuilderDeps,
   files: TFile[],
-  ctx: {
-    spaceKey: string;
-    parentPageId?: string;
-  },
+  ctx: ExportReviewContext,
+  root: TFile,
 ): Promise<ExportPlanItem[]> {
   const items: ExportPlanItem[] = [];
   const converter = new ConfluenceStorageConverter();
   const snapshots = new SnapshotService(deps.app);
+
+  // Build hierarchy preview (only for UI: intendedParentFilePath + depth)
+  const hierarchy = buildHierarchy(
+    deps.app,
+    root,
+    files,
+    ctx.hierarchyMode,
+    ctx.hierarchyManyToManyPolicy,
+  );
 
   const resolveWikiLink = (target: string, fromPath: string) => {
     const dest = deps.app.metadataCache.getFirstLinkpathDest(target, fromPath);
@@ -101,6 +82,10 @@ export async function buildExportPlan(
       reason: "No mapping found.",
       hasSnapshot: false,
       hasDiff: false,
+
+      // hierarchy preview fields
+      intendedParentFilePath: hierarchy.parentPathByPath.get(file.path) ?? null,
+      depth: hierarchy.depthByPath.get(file.path) ?? 0,
     };
 
     // ---------- CASE 1: Mapping exists ----------
@@ -109,10 +94,9 @@ export async function buildExportPlan(
         const page = await deps.client.getPageWithStorage(mapped.pageId);
         const existingStorage = page?.body?.storage?.value ?? "";
 
-        const mdOriginal = await deps.app.vault.read(file);
-        const mdPublish = toPublishMarkdown(mdOriginal);
-
-        const newStorage = converter.convert(mdPublish, {
+        // Current file markdown + new storage
+        const md = await deps.app.vault.read(file);
+        const newStorage = converter.convert(md, {
           spaceKey: ctx.spaceKey,
           fromPath: file.path,
           resolveWikiLink,
@@ -120,7 +104,7 @@ export async function buildExportPlan(
 
         const b = normaliseStorage(newStorage);
 
-        // Prefer last-exported storage snapshot as baseline (best stability)
+        // Prefer our last-exported storage snapshot baseline.
         const oldStorageSnap = await snapshots.readStorageSnapshot?.(file.path);
         const a = oldStorageSnap ?? normaliseStorage(existingStorage);
 
@@ -129,27 +113,28 @@ export async function buildExportPlan(
           ? deps.client.toWebUrl(page._links.webui)
           : mapped.webui;
 
+        // Title change awareness
         const existingTitle = String(page?.title ?? mapped.title ?? title);
         item.existingTitle = existingTitle;
         item.titleChanged = existingTitle !== title;
 
         const contentDiffers = a !== b;
 
-        // Snapshot awareness (markdown snapshot stores publish-markdown)
+        // Snapshot awareness (markdown snapshot for nicer diffs)
         const snapMdExists = await snapshots.hasSnapshot(file.path);
         item.hasSnapshot = snapMdExists;
 
         if (snapMdExists) {
           const oldMd = (await snapshots.readSnapshot(file.path)) ?? "";
           item.diffOld = normaliseTextForDiff(oldMd);
-          item.diffNew = normaliseTextForDiff(mdPublish);
+          item.diffNew = normaliseTextForDiff(md);
           item.hasDiff = true;
         } else {
           item.diffOld = "";
-          item.diffNew = normaliseTextForDiff(mdPublish);
+          item.diffNew = normaliseTextForDiff(md);
           item.hasDiff = true;
           item.reason +=
-            " (No previous publish snapshot yet — showing current publish content only.)";
+            " (No markdown snapshot yet — showing current note only.)";
         }
 
         if (!contentDiffers && !item.titleChanged) {
@@ -181,15 +166,14 @@ export async function buildExportPlan(
           const snapMdExists = await snapshots.hasSnapshot(file.path);
           item.hasSnapshot = snapMdExists;
 
-          const mdOriginal = await deps.app.vault.read(file);
-          const mdPublish = toPublishMarkdown(mdOriginal);
+          const md = await deps.app.vault.read(file);
 
           item.diffOld = normaliseTextForDiff(
             snapMdExists
               ? ((await snapshots.readSnapshot(file.path)) ?? "")
               : "",
           );
-          item.diffNew = normaliseTextForDiff(mdPublish);
+          item.diffNew = normaliseTextForDiff(md);
 
           item.reason =
             "Mapping exists but page was deleted (404). Will recreate.";
@@ -211,10 +195,8 @@ export async function buildExportPlan(
           const page = await deps.client.getPageWithStorage(found.id);
           const existingStorage = page?.body?.storage?.value ?? "";
 
-          const mdOriginal = await deps.app.vault.read(file);
-          const mdPublish = toPublishMarkdown(mdOriginal);
-
-          const newStorage = converter.convert(mdPublish, {
+          const md = await deps.app.vault.read(file);
+          const newStorage = converter.convert(md, {
             spaceKey: ctx.spaceKey,
             fromPath: file.path,
             resolveWikiLink,
@@ -242,10 +224,10 @@ export async function buildExportPlan(
           if (snapMdExists) {
             const oldMd = (await snapshots.readSnapshot(file.path)) ?? "";
             item.diffOld = normaliseTextForDiff(oldMd);
-            item.diffNew = normaliseTextForDiff(mdPublish);
+            item.diffNew = normaliseTextForDiff(md);
           } else {
-            item.diffOld = "";
-            item.diffNew = normaliseTextForDiff(mdPublish);
+            item.diffOld = normaliseTextForDiff(a);
+            item.diffNew = normaliseTextForDiff(b);
           }
 
           if (!contentDiffers) {
