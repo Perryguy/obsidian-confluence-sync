@@ -26,7 +26,42 @@ function normaliseTextForDiff(t: string): string {
     .replace(/\r/g, "\n")
     .split("\n")
     .map((l) => l.replace(/[ \t]+$/g, ""))
-    .join("\n");
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Must match Exporter.toPublishMarkdown() behaviour (so plan === publish).
+ * - removes YAML frontmatter
+ * - strips inline #tags (not in code blocks / inline code)
+ */
+function toPublishMarkdown(markdown: string): string {
+  if (!markdown) return "";
+
+  let s = markdown.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "");
+
+  const holes: string[] = [];
+  s = s.replace(/```[\s\S]*?```/g, (m) => {
+    holes.push(m);
+    return `@@HOLE_${holes.length - 1}@@`;
+  });
+  s = s.replace(/~~~[\s\S]*?~~~/g, (m) => {
+    holes.push(m);
+    return `@@HOLE_${holes.length - 1}@@`;
+  });
+  s = s.replace(/`[^`]*`/g, (m) => {
+    holes.push(m);
+    return `@@HOLE_${holes.length - 1}@@`;
+  });
+
+  s = s.replace(/(^|[\s(])#([A-Za-z0-9/_-]+)\b/gm, "$1");
+
+  s = s.replace(/@@HOLE_(\d+)@@/g, (_m, idx) => {
+    const i = Number(idx);
+    return Number.isFinite(i) ? (holes[i] ?? "") : "";
+  });
+
+  return normaliseTextForDiff(s);
 }
 
 export async function buildExportPlan(
@@ -74,19 +109,18 @@ export async function buildExportPlan(
         const page = await deps.client.getPageWithStorage(mapped.pageId);
         const existingStorage = page?.body?.storage?.value ?? "";
 
-        // Current file markdown + new storage
-        const md = await deps.app.vault.read(file);
-        const newStorage = converter.convert(md, {
+        const mdOriginal = await deps.app.vault.read(file);
+        const mdPublish = toPublishMarkdown(mdOriginal);
+
+        const newStorage = converter.convert(mdPublish, {
           spaceKey: ctx.spaceKey,
           fromPath: file.path,
           resolveWikiLink,
         });
 
-        // Normalise new storage
         const b = normaliseStorage(newStorage);
 
-        // Prefer our last-exported storage snapshot as baseline.
-        // This avoids Confluence canonicalisation causing perpetual diffs.
+        // Prefer last-exported storage snapshot as baseline (best stability)
         const oldStorageSnap = await snapshots.readStorageSnapshot?.(file.path);
         const a = oldStorageSnap ?? normaliseStorage(existingStorage);
 
@@ -95,35 +129,29 @@ export async function buildExportPlan(
           ? deps.client.toWebUrl(page._links.webui)
           : mapped.webui;
 
-        // Title change awareness (never skip if title changed)
         const existingTitle = String(page?.title ?? mapped.title ?? title);
         item.existingTitle = existingTitle;
         item.titleChanged = existingTitle !== title;
 
         const contentDiffers = a !== b;
 
-        // Snapshot awareness (markdown snapshot for nicer diffs)
+        // Snapshot awareness (markdown snapshot stores publish-markdown)
         const snapMdExists = await snapshots.hasSnapshot(file.path);
         item.hasSnapshot = snapMdExists;
 
-        // Provide diff text:
-        // - Prefer snapshot markdown diff (best UX)
-        // - Otherwise diff normalised storage vs normalised storage
         if (snapMdExists) {
           const oldMd = (await snapshots.readSnapshot(file.path)) ?? "";
           item.diffOld = normaliseTextForDiff(oldMd);
-          item.diffNew = normaliseTextForDiff(md);
+          item.diffNew = normaliseTextForDiff(mdPublish);
           item.hasDiff = true;
         } else {
-          // No snapshot -> don't lie with HTML noise.
           item.diffOld = "";
-          item.diffNew = normaliseTextForDiff(md);
-          item.hasDiff = true; // still allow diff so user sees "new content"
+          item.diffNew = normaliseTextForDiff(mdPublish);
+          item.hasDiff = true;
           item.reason +=
-            " (No markdown snapshot yet — showing current note only.)";
+            " (No previous publish snapshot yet — showing current publish content only.)";
         }
 
-        // Decide action
         if (!contentDiffers && !item.titleChanged) {
           item.action = "skip";
           item.selected = false;
@@ -150,18 +178,18 @@ export async function buildExportPlan(
           item.pageId = mapped.pageId;
           item.hasDiff = true;
 
-          // For recreate: diff = snapshot markdown vs current markdown if available
           const snapMdExists = await snapshots.hasSnapshot(file.path);
           item.hasSnapshot = snapMdExists;
 
-          const md = await deps.app.vault.read(file);
+          const mdOriginal = await deps.app.vault.read(file);
+          const mdPublish = toPublishMarkdown(mdOriginal);
 
           item.diffOld = normaliseTextForDiff(
             snapMdExists
               ? ((await snapshots.readSnapshot(file.path)) ?? "")
               : "",
           );
-          item.diffNew = normaliseTextForDiff(md);
+          item.diffNew = normaliseTextForDiff(mdPublish);
 
           item.reason =
             "Mapping exists but page was deleted (404). Will recreate.";
@@ -180,12 +208,13 @@ export async function buildExportPlan(
         const found = await deps.client.searchPageByTitle(ctx.spaceKey, title);
 
         if (found?.id) {
-          // Fetch storage so we can correctly detect "no changes"
           const page = await deps.client.getPageWithStorage(found.id);
           const existingStorage = page?.body?.storage?.value ?? "";
 
-          const md = await deps.app.vault.read(file);
-          const newStorage = converter.convert(md, {
+          const mdOriginal = await deps.app.vault.read(file);
+          const mdPublish = toPublishMarkdown(mdOriginal);
+
+          const newStorage = converter.convert(mdPublish, {
             spaceKey: ctx.spaceKey,
             fromPath: file.path,
             resolveWikiLink,
@@ -193,7 +222,6 @@ export async function buildExportPlan(
 
           const b = normaliseStorage(newStorage);
 
-          // Prefer last-exported storage snapshot baseline if it exists.
           const oldStorageSnap = await snapshots.readStorageSnapshot?.(
             file.path,
           );
@@ -214,10 +242,10 @@ export async function buildExportPlan(
           if (snapMdExists) {
             const oldMd = (await snapshots.readSnapshot(file.path)) ?? "";
             item.diffOld = normaliseTextForDiff(oldMd);
-            item.diffNew = normaliseTextForDiff(md);
+            item.diffNew = normaliseTextForDiff(mdPublish);
           } else {
-            item.diffOld = normaliseTextForDiff(a);
-            item.diffNew = normaliseTextForDiff(b);
+            item.diffOld = "";
+            item.diffNew = normaliseTextForDiff(mdPublish);
           }
 
           if (!contentDiffers) {
@@ -249,7 +277,6 @@ export async function buildExportPlan(
       }
     }
 
-    // belt & braces
     if (item.action === "skip") item.selected = false;
 
     items.push(item);

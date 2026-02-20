@@ -23,6 +23,58 @@ export class Exporter {
     this.snapshots = new SnapshotService(app);
   }
 
+  // -----------------------------------------
+  // Publish markdown pipeline
+  // -----------------------------------------
+  /**
+   * Returns markdown that is safe/clean to publish:
+   * - removes YAML frontmatter block
+   * - strips inline Obsidian tags (#foo, #foo/bar) from text
+   * - DOES NOT touch code blocks / inline code
+   */
+  private toPublishMarkdown(markdown: string): string {
+    if (!markdown) return "";
+
+    // 1) Remove frontmatter (prevents it showing up as body text)
+    let s = markdown.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "");
+
+    // 2) Protect fenced code blocks + inline code
+    const holes: string[] = [];
+    s = s.replace(/```[\s\S]*?```/g, (m) => {
+      holes.push(m);
+      return `@@HOLE_${holes.length - 1}@@`;
+    });
+    s = s.replace(/~~~[\s\S]*?~~~/g, (m) => {
+      holes.push(m);
+      return `@@HOLE_${holes.length - 1}@@`;
+    });
+    s = s.replace(/`[^`]*`/g, (m) => {
+      holes.push(m);
+      return `@@HOLE_${holes.length - 1}@@`;
+    });
+
+    // 3) Strip inline tags (avoid headings by requiring whitespace or '(' before '#')
+    // Keep the leading delimiter (group 1) so we don't glue words together.
+    s = s.replace(/(^|[\s(])#([A-Za-z0-9/_-]+)\b/gm, "$1");
+
+    // 4) Restore holes
+    s = s.replace(/@@HOLE_(\d+)@@/g, (_m, idx) => {
+      const i = Number(idx);
+      return Number.isFinite(i) ? (holes[i] ?? "") : "";
+    });
+
+    // 5) Tidy: collapse trailing whitespace
+    s = s
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .split("\n")
+      .map((l) => l.replace(/[ \t]+$/g, ""))
+      .join("\n")
+      .trim();
+
+    return s;
+  }
+
   async exportFromRoot(root: TFile): Promise<void> {
     await this.mapping.load();
 
@@ -262,8 +314,14 @@ export class Exporter {
     parentIdOverride?: string,
   ): Promise<void> {
     const title = file.basename;
-    const md = await this.app.vault.read(file);
-    const storageRaw = this.converter.convert(md, this.makeCtx(file));
+
+    // Read original markdown (for tag extraction)
+    const mdOriginal = await this.app.vault.read(file);
+
+    // Clean markdown for publishing (removes inline #tags + frontmatter)
+    const mdPublish = this.toPublishMarkdown(mdOriginal);
+
+    const storageRaw = this.converter.convert(mdPublish, this.makeCtx(file));
     const storageNorm = normaliseStorage(storageRaw);
 
     const mapped = this.mapping.get(file.path);
@@ -330,9 +388,10 @@ export class Exporter {
     });
 
     // ✅ Write snapshots in pass 1 (so diffs work immediately on next plan build)
+    // NOTE: markdown snapshot stores "published markdown" (what Confluence received)
     if (!this.settings.dryRun) {
       try {
-        await this.snapshots.writeSnapshot(file.path, md);
+        await this.snapshots.writeSnapshot(file.path, mdPublish);
       } catch (e: any) {
         console.warn(
           `[Confluence] Snapshot write failed for ${file.path} (continuing):`,
@@ -350,9 +409,10 @@ export class Exporter {
       }
     }
 
+    // Labels from ORIGINAL markdown (so you still get inline tags / frontmatter tags as labels)
     try {
       const { extractObsidianTags, toConfluenceLabel } = await import("./tags");
-      const tags = extractObsidianTags(md)
+      const tags = extractObsidianTags(mdOriginal)
         .map(toConfluenceLabel)
         .filter(Boolean);
       await this.client.addLabels(pageId, tags);
@@ -386,9 +446,11 @@ export class Exporter {
     if (!entry?.pageId) return;
 
     const desiredTitle = file.basename;
-    const md = await this.app.vault.read(file);
 
-    const newStorageRaw = this.converter.convert(md, this.makeCtx(file));
+    const mdOriginal = await this.app.vault.read(file);
+    const mdPublish = this.toPublishMarkdown(mdOriginal);
+
+    const newStorageRaw = this.converter.convert(mdPublish, this.makeCtx(file));
     const newStorageNorm = normaliseStorage(newStorageRaw);
 
     // Fetch current Confluence page (storage + title)
@@ -428,9 +490,9 @@ export class Exporter {
     if (bodyUnchanged && titleUnchanged) {
       console.log(`[Confluence] Skipping update (no changes): ${file.path}`);
 
-      // ✅ Still refresh snapshots so the diff UX works and baseline stays current
+      // ✅ Still refresh snapshots so plan diffs stay correct
       try {
-        await this.snapshots.writeSnapshot(file.path, md);
+        await this.snapshots.writeSnapshot(file.path, mdPublish);
       } catch (e: any) {
         console.warn(
           `[Confluence] Snapshot write failed for ${file.path} (continuing):`,
@@ -455,7 +517,7 @@ export class Exporter {
 
       // Snapshot best-effort
       try {
-        await this.snapshots.writeSnapshot(file.path, md);
+        await this.snapshots.writeSnapshot(file.path, mdPublish);
       } catch (e: any) {
         console.warn(
           `[Confluence] Snapshot write failed for ${file.path} (continuing):`,

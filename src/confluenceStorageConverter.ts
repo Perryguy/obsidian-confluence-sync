@@ -1,6 +1,8 @@
+// src/confluenceStorageConverter.ts
 import MarkdownIt from "markdown-it";
 import taskLists from "markdown-it-task-lists";
 import footnote from "markdown-it-footnote";
+
 type MdToken = ReturnType<MarkdownIt["parse"]>[number];
 
 export type ResolveWikiLinkFn = (
@@ -15,7 +17,7 @@ export interface ConvertContext {
 }
 
 function escapeXml(s: string): string {
-  return s
+  return (s ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -28,9 +30,28 @@ function codeMacro(code: string, language?: string): string {
   return (
     `<ac:structured-macro ac:name="code">` +
     `<ac:parameter ac:name="language">${escapeXml(lang)}</ac:parameter>` +
-    `<ac:plain-text-body><![CDATA[${code}]]></ac:plain-text-body>` +
+    `<ac:plain-text-body><![CDATA[${code ?? ""}]]></ac:plain-text-body>` +
     `</ac:structured-macro>`
   );
+}
+
+// -----------------------------
+// Confluence task list macros
+// -----------------------------
+function taskListMacro(
+  tasks: Array<{ status: "complete" | "incomplete"; body: string }>,
+): string {
+  const inner = tasks
+    .map(
+      (t) =>
+        `<ac:task>` +
+        `<ac:task-status>${t.status}</ac:task-status>` +
+        `<ac:task-body>${t.body}</ac:task-body>` +
+        `</ac:task>`,
+    )
+    .join("");
+
+  return `<ac:task-list>${inner}</ac:task-list>`;
 }
 
 function panelColorsFor(type: string) {
@@ -98,50 +119,23 @@ function panelMacro(title: string, bodyStorage: string, type: string): string {
   );
 }
 
-function panelStyleFor(type: string): string {
-  // Confluence panelStyle supports CSS-like style string
-  // Keep it conservative so Cloud accepts it.
-  switch (type) {
-    case "warning":
-    case "caution":
-      return "border-color: #FFAB00; background-color: #FFFAE6;";
-    case "danger":
-    case "error":
-    case "fail":
-      return "border-color: #DE350B; background-color: #FFEBE6;";
-    case "success":
-    case "done":
-    case "check":
-      return "border-color: #36B37E; background-color: #E3FCEF;";
-    case "tip":
-    case "hint":
-      return "border-color: #00B8D9; background-color: #E6FCFF;";
-    case "note":
-    case "info":
-    default:
-      return "border-color: #4C9AFF; background-color: #DEEBFF;";
-  }
-}
-
 function confluencePageLink(
   spaceKey: string,
   pageTitle: string,
   bodyText: string,
 ): string {
-  // Using title+space is the most compatible form across Cloud + DC
   return (
     `<ac:link>` +
     `<ri:page ri:space-key="${escapeXml(spaceKey)}" ri:content-title="${escapeXml(pageTitle)}" />` +
-    `<ac:plain-text-link-body><![CDATA[${bodyText}]]></ac:plain-text-link-body>` +
+    `<ac:plain-text-link-body><![CDATA[${bodyText ?? ""}]]></ac:plain-text-link-body>` +
     `</ac:link>`
   );
 }
 
 type WikiLinkMeta = { target: string; alias?: string };
-type EmbedMeta = { target: string; alias?: string };
 
 function normalizeWikiTarget(raw: string): string {
-  return raw.split("#")[0].trim();
+  return (raw ?? "").split("#")[0].trim();
 }
 
 /**
@@ -158,7 +152,6 @@ function obsidianLinksPlugin(md: MarkdownIt) {
       const pos = state.pos;
       const src = state.src;
 
-      // Bounds check
       if (pos >= src.length) return false;
 
       const startsWith = (s: string) => src.startsWith(s, pos);
@@ -175,7 +168,6 @@ function obsidianLinksPlugin(md: MarkdownIt) {
       const inner = src.slice(start, end).trim();
       if (!inner) return false;
 
-      // IMPORTANT: always advance pos if we claim a match
       const nextPos = end + 2;
 
       if (silent) {
@@ -204,7 +196,7 @@ export class ConfluenceStorageConverter {
     this.md = new MarkdownIt({
       html: false,
       linkify: true,
-      breaks: false,
+      breaks: false, // we handle softbreak ourselves
     })
       .use(taskLists, { enabled: true })
       .use(footnote)
@@ -212,7 +204,7 @@ export class ConfluenceStorageConverter {
   }
 
   convert(markdown: string, ctx: ConvertContext): string {
-    const tokens = this.md.parse(markdown, {});
+    const tokens = this.md.parse(markdown ?? "", {});
     return this.renderBlock(tokens, ctx);
   }
 
@@ -247,35 +239,8 @@ export class ConfluenceStorageConverter {
           i++;
           break;
 
-        case "bullet_list_open":
-          out += "<ul>";
-          i++;
-          break;
-        case "bullet_list_close":
-          out += "</ul>";
-          i++;
-          break;
-
-        case "ordered_list_open":
-          out += "<ol>";
-          i++;
-          break;
-        case "ordered_list_close":
-          out += "</ol>";
-          i++;
-          break;
-
-        case "list_item_open":
-          out += "<li>";
-          i++;
-          break;
-        case "list_item_close":
-          out += "</li>";
-          i++;
-          break;
-
         case "blockquote_open": {
-          // Callout detection: > [!info] Title
+          // Callout detection
           const callout = this.tryParseCallout(tokens, i, ctx);
           if (callout) {
             out += callout.rendered;
@@ -286,6 +251,7 @@ export class ConfluenceStorageConverter {
           }
           break;
         }
+
         case "blockquote_close":
           out += "</blockquote>";
           i++;
@@ -303,7 +269,49 @@ export class ConfluenceStorageConverter {
           i++;
           break;
 
-        // Tables (markdown-it built-in)
+        // ✅ Task lists: detect and convert to <ac:task-list>
+        case "bullet_list_open": {
+          const parsed = this.tryParseTaskList(tokens, i, ctx, "bullet_list");
+          if (parsed) {
+            out += parsed.rendered;
+            i = parsed.nextIndex;
+          } else {
+            out += "<ul>";
+            i++;
+          }
+          break;
+        }
+        case "bullet_list_close":
+          out += "</ul>";
+          i++;
+          break;
+
+        case "ordered_list_open": {
+          const parsed = this.tryParseTaskList(tokens, i, ctx, "ordered_list");
+          if (parsed) {
+            out += parsed.rendered;
+            i = parsed.nextIndex;
+          } else {
+            out += "<ol>";
+            i++;
+          }
+          break;
+        }
+        case "ordered_list_close":
+          out += "</ol>";
+          i++;
+          break;
+
+        case "list_item_open":
+          out += "<li>";
+          i++;
+          break;
+        case "list_item_close":
+          out += "</li>";
+          i++;
+          break;
+
+        // Tables
         case "table_open":
           out += "<table>";
           i++;
@@ -354,8 +362,8 @@ export class ConfluenceStorageConverter {
           break;
 
         default:
-          // ignore unsupported token types safely
-          if (t.content) out += `<p>${escapeXml(t.content)}</p>`;
+          if ((t as any).content)
+            out += `<p>${escapeXml((t as any).content)}</p>`;
           i++;
           break;
       }
@@ -377,8 +385,9 @@ export class ConfluenceStorageConverter {
           i++;
           break;
 
+        // ✅ Preserve visible newlines
         case "softbreak":
-          out += "\n";
+          out += "<br />";
           i++;
           break;
 
@@ -425,11 +434,8 @@ export class ConfluenceStorageConverter {
           const target = normalizeWikiTarget(meta.target);
           const alias = meta.alias?.trim() || target;
 
-          // We render embeds as attachments (filename) — exporter will upload them
           const resolved = ctx.resolveWikiLink(target, ctx.fromPath);
           if (resolved) {
-            // resolved.title here is a NOTE title (for links). For embeds, we want the filename.
-            // We'll pass filename via resolver when it's an attachment (see exporter ctx below).
             const filename = resolved.title;
             out += `<ac:image><ri:attachment ri:filename="${escapeXml(filename)}" /></ac:image>`;
           } else {
@@ -454,15 +460,17 @@ export class ConfluenceStorageConverter {
           break;
         }
 
-        // task list checkboxes from markdown-it-task-lists often appear as html_inline
+        // ✅ IMPORTANT: do NOT render checkbox HTML as ☑/☐ here.
+        // We convert entire lists into Confluence <ac:task-list> in tryParseTaskList().
+        // If a checkbox slips through outside a list, just ignore it.
         case "html_inline": {
           const html = t.content ?? "";
           if (html.includes("task-list-item-checkbox")) {
-            const checked = /\bchecked\b/i.test(html);
-            out += checked ? "☑ " : "☐ ";
-          } else {
-            out += escapeXml(html);
+            // swallow
+            i++;
+            break;
           }
+          out += escapeXml(html);
           i++;
           break;
         }
@@ -481,7 +489,8 @@ export class ConfluenceStorageConverter {
     let s = "";
     for (const t of tokens) {
       if (t.type === "text" || t.type === "code_inline") s += t.content ?? "";
-      else if (t.type === "softbreak" || t.type === "hardbreak") s += " ";
+      else if (t.type === "softbreak" || t.type === "hardbreak")
+        s += "\n"; // keep line breaks for tasks/callouts
       else if (t.children?.length) s += this.inlinePlainText(t.children);
     }
     return s.trim();
@@ -498,16 +507,107 @@ export class ConfluenceStorageConverter {
     return openIdx;
   }
 
+  // -----------------------------
+  // Task list parsing
+  // -----------------------------
+  private tryParseTaskList(
+    tokens: MdToken[],
+    listOpenIdx: number,
+    ctx: ConvertContext,
+    listKind: "bullet_list" | "ordered_list",
+  ): { rendered: string; nextIndex: number } | null {
+    const openType =
+      listKind === "bullet_list" ? "bullet_list_open" : "ordered_list_open";
+    const closeType =
+      listKind === "bullet_list" ? "bullet_list_close" : "ordered_list_close";
+
+    if (tokens[listOpenIdx]?.type !== openType) return null;
+
+    // Find matching list_close
+    let depth = 0;
+    let j = listOpenIdx;
+    for (; j < tokens.length; j++) {
+      if (tokens[j].type === openType) depth++;
+      if (tokens[j].type === closeType) {
+        depth--;
+        if (depth === 0) break;
+      }
+    }
+    if (j >= tokens.length) return null;
+
+    // Parse only top-level list items in this list (no recursion for now)
+    const tasks: Array<{ status: "complete" | "incomplete"; body: string }> =
+      [];
+    let k = listOpenIdx + 1;
+    let sawAnyTask = false;
+
+    while (k < j) {
+      if (tokens[k].type !== "list_item_open") {
+        k++;
+        continue;
+      }
+
+      // Find end of this list item
+      let itemDepth = 0;
+      let end = k;
+      for (; end < j; end++) {
+        if (tokens[end].type === "list_item_open") itemDepth++;
+        if (tokens[end].type === "list_item_close") {
+          itemDepth--;
+          if (itemDepth === 0) break;
+        }
+      }
+
+      const slice = tokens.slice(k, end + 1);
+
+      // Locate the first inline in the item (common structure: li_open, p_open, inline, p_close, li_close)
+      const inlineTok = slice.find((x) => x.type === "inline") as any;
+      const children: MdToken[] = (inlineTok?.children ?? []) as any;
+
+      const checkboxIdx = children.findIndex(
+        (c) =>
+          c.type === "html_inline" &&
+          (c.content ?? "").includes("task-list-item-checkbox"),
+      );
+
+      if (checkboxIdx !== -1) {
+        sawAnyTask = true;
+        const cbHtml = children[checkboxIdx].content ?? "";
+        const checked = /\bchecked\b/i.test(cbHtml);
+
+        // Body tokens are everything AFTER the checkbox token
+        const bodyTokens = children.slice(checkboxIdx + 1);
+
+        // Render body: use inline renderer so links/wikilinks still become Confluence links
+        const bodyStorage = this.renderInline(bodyTokens, ctx)
+          // tidy leading spaces/brs that come from markdown-it sometimes
+          .replace(/^(\s|<br\s*\/?>)+/i, "")
+          .trim();
+
+        tasks.push({
+          status: checked ? "complete" : "incomplete",
+          body: bodyStorage || "",
+        });
+      }
+
+      k = end + 1;
+    }
+
+    if (!sawAnyTask) return null;
+
+    // If mixed list (some items task, some not), we still output a task-list for the task items only.
+    // (Better UX than losing task semantics.)
+    return { rendered: taskListMacro(tasks), nextIndex: j + 1 };
+  }
+
+  // -----------------------------
+  // Callouts
+  // -----------------------------
   private tryParseCallout(
     tokens: any[],
     blockquoteOpenIndex: number,
     ctx: ConvertContext,
   ): { rendered: string; nextIndex: number } | null {
-    // Expect:
-    // blockquote_open
-    // paragraph_open
-    // inline (header + maybe body in same paragraph)
-    // paragraph_close
     if (tokens[blockquoteOpenIndex]?.type !== "blockquote_open") return null;
     if (tokens[blockquoteOpenIndex + 1]?.type !== "paragraph_open") return null;
 
@@ -517,7 +617,6 @@ export class ConfluenceStorageConverter {
     const children: any[] = inlineTok.children ?? [];
     if (children.length === 0) return null;
 
-    // Split inline children at the first line break (softbreak/hardbreak)
     const brIndex = children.findIndex(
       (t) => t.type === "softbreak" || t.type === "hardbreak",
     );
@@ -544,20 +643,15 @@ export class ConfluenceStorageConverter {
     }
     if (j >= tokens.length) return null;
 
-    // Build body tokens:
-    //  - If there was remaining content in the first paragraph, keep it as a paragraph.
-    //  - Then include the rest of the blockquote tokens after the first paragraph_close.
+    // Build body tokens
     const body: any[] = [];
 
     if (restChildren.length > 0) {
-      // Recreate the paragraph with remaining inline children
       body.push({ type: "paragraph_open", tag: "p" });
       body.push({ type: "inline", children: restChildren });
       body.push({ type: "paragraph_close", tag: "p" });
     }
 
-    // After paragraph_close comes the rest of the blockquote content
-    // header structure indexes: open, p_open, inline, p_close
     const afterFirstParagraph = blockquoteOpenIndex + 4;
     for (let k = afterFirstParagraph; k < j; k++) body.push(tokens[k]);
 
