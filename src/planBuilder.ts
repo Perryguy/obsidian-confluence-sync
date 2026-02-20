@@ -1,6 +1,10 @@
+// src/planBuilder.ts
 import { App, TFile } from "obsidian";
 import type { ConfluenceClient } from "./confluenceClient";
 import type { ExportPlanItem } from "./exportPlan";
+import { ConfluenceStorageConverter } from "./confluenceStorageConverter";
+import { normaliseStorage } from "./storageNormalise";
+import { SnapshotService } from "./snapshots";
 
 export interface PlanBuilderDeps {
   app: App;
@@ -15,36 +19,40 @@ export interface PlanBuilderDeps {
   };
 }
 
-export interface BuildPlanOptions {
-  spaceKey: string;
-  /** Optional parent page id for *this export* */
-  parentPageId?: string;
-}
-
-function escapeCqlString(s: string): string {
-  // CQL string escaping for backslashes and quotes
-  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+function normaliseTextForDiff(t: string): string {
+  // Prevent "everything changed" due to CRLF vs LF or trailing whitespace.
+  return (t ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((l) => l.replace(/[ \t]+$/g, ""))
+    .join("\n");
 }
 
 export async function buildExportPlan(
   deps: PlanBuilderDeps,
   files: TFile[],
-  opts: BuildPlanOptions,
+  ctx: {
+    spaceKey: string;
+    parentPageId?: string;
+  },
 ): Promise<ExportPlanItem[]> {
   const items: ExportPlanItem[] = [];
-  const spaceKey = opts.spaceKey?.trim();
-  const parentPageId = opts.parentPageId?.trim() || undefined;
+  const converter = new ConfluenceStorageConverter();
+  const snapshots = new SnapshotService(deps.app);
 
-  if (!spaceKey) {
-    // If no space key, everything becomes skip (UI will show why)
-    return files.map((f) => ({
-      filePath: f.path,
-      title: f.basename,
-      selected: false,
-      action: "skip",
-      reason: "No Space Key set for this export.",
-    }));
-  }
+  const resolveWikiLink = (target: string, fromPath: string) => {
+    const dest = deps.app.metadataCache.getFirstLinkpathDest(target, fromPath);
+    if (dest && typeof dest === "object" && "extension" in (dest as any)) {
+      const d = dest as any;
+      if (d.extension === "md") {
+        const mapped2 = deps.mapping.get(d.path);
+        return { title: mapped2?.title ?? d.basename };
+      }
+      return { title: d.name };
+    }
+    return null;
+  };
 
   for (const file of files) {
     const title = file.basename;
@@ -56,125 +64,189 @@ export async function buildExportPlan(
       selected: true,
       action: "create",
       reason: "No mapping found.",
+      hasSnapshot: false,
+      hasDiff: false,
     };
 
-    // 1) If mapped, prefer that first
+    // ---------- CASE 1: Mapping exists ----------
     if (mapped?.pageId) {
       try {
-        // We want ancestors/space if possible. If your client.getPage doesn't expand,
-        // it should still return 200/404 and links; plan still works.
-        const page: any = await deps.client.getPage(mapped.pageId);
+        const page = await deps.client.getPageWithStorage(mapped.pageId);
+        const existingStorage = page?.body?.storage?.value ?? "";
 
-        item.action = "update";
+        // Current file markdown + new storage
+        const md = await deps.app.vault.read(file);
+        const newStorage = converter.convert(md, {
+          spaceKey: ctx.spaceKey,
+          fromPath: file.path,
+          resolveWikiLink,
+        });
+
+        // Normalise new storage
+        const b = normaliseStorage(newStorage);
+
+        // Prefer our last-exported storage snapshot as baseline.
+        // This avoids Confluence canonicalisation causing perpetual diffs.
+        const oldStorageSnap = await snapshots.readStorageSnapshot?.(file.path);
+        const a = oldStorageSnap ?? normaliseStorage(existingStorage);
+
         item.pageId = String(page.id);
-        item.webui = page?._links?.webui
+        item.webui = page._links?.webui
           ? deps.client.toWebUrl(page._links.webui)
           : mapped.webui;
 
-        // Optional: detect parent mismatch if ancestors are available
-        if (parentPageId && Array.isArray(page?.ancestors)) {
-          const underParent = page.ancestors.some(
-            (a: any) => String(a?.id) === parentPageId,
-          );
-          if (!underParent) {
-            // It's a real page, but not under chosen parent → conflict
-            item.action = "conflict";
-            item.selected = false;
-            item.conflictPageId = item.pageId;
-            item.conflictWebui = item.webui;
-            item.pageId = undefined;
-            item.webui = undefined;
-            item.reason =
-              "Mapping points to an existing page, but it is not under the chosen Parent Page.";
-          } else {
-            item.reason = "Mapping exists; page found.";
-          }
+        // Title change awareness (never skip if title changed)
+        const existingTitle = String(page?.title ?? mapped.title ?? title);
+        item.existingTitle = existingTitle;
+        item.titleChanged = existingTitle !== title;
+
+        const contentDiffers = a !== b;
+
+        // Snapshot awareness (markdown snapshot for nicer diffs)
+        const snapMdExists = await snapshots.hasSnapshot(file.path);
+        item.hasSnapshot = snapMdExists;
+
+        // Provide diff text:
+        // - Prefer snapshot markdown diff (best UX)
+        // - Otherwise diff normalised storage vs normalised storage
+        if (snapMdExists) {
+          const oldMd = (await snapshots.readSnapshot(file.path)) ?? "";
+          item.diffOld = normaliseTextForDiff(oldMd);
+          item.diffNew = normaliseTextForDiff(md);
         } else {
-          item.reason = "Mapping exists; page found.";
+          item.diffOld = normaliseTextForDiff(a);
+          item.diffNew = normaliseTextForDiff(b);
+        }
+
+        // Decide action
+        if (!contentDiffers && !item.titleChanged) {
+          item.action = "skip";
+          item.selected = false;
+          item.hasDiff = false;
+          item.reason = oldStorageSnap
+            ? "No content changes detected (storage snapshot baseline)."
+            : "No content changes detected (normalized).";
+        } else {
+          item.action = "update";
+          item.selected = true;
+          item.hasDiff = true;
+          item.reason = item.titleChanged
+            ? "Title changed (will update page title)."
+            : oldStorageSnap
+              ? "Content differs from last export (storage snapshot baseline)."
+              : "Content differs from Confluence (normalized).";
         }
       } catch (e: any) {
         const msg = String(e?.message ?? e);
+
         if (msg.includes(" 404")) {
           item.action = "recreate";
+          item.selected = true;
           item.pageId = mapped.pageId;
+          item.hasDiff = true;
+
+          // For recreate: diff = snapshot markdown vs current markdown if available
+          const snapMdExists = await snapshots.hasSnapshot(file.path);
+          item.hasSnapshot = snapMdExists;
+
+          const md = await deps.app.vault.read(file);
+
+          item.diffOld = normaliseTextForDiff(
+            snapMdExists
+              ? ((await snapshots.readSnapshot(file.path)) ?? "")
+              : "",
+          );
+          item.diffNew = normaliseTextForDiff(md);
+
           item.reason =
             "Mapping exists but page was deleted (404). Will recreate.";
         } else {
           item.action = "skip";
           item.selected = false;
+          item.hasDiff = false;
           item.reason = `Could not verify mapped page: ${msg}`;
         }
       }
-
-      items.push(item);
-      continue;
     }
 
-    // 2) If no mapping but updateExisting enabled, search Confluence by title
-    if (deps.settings.updateExisting) {
-      const escapedTitle = escapeCqlString(title);
+    // ---------- CASE 2: No mapping, but updateExisting enabled ----------
+    else if (deps.settings.updateExisting) {
+      try {
+        const found = await deps.client.searchPageByTitle(ctx.spaceKey, title);
 
-      // If parent is set, search under parent first
-      if (parentPageId) {
-        const underParent = await deps.client.searchPageByTitle(
-          spaceKey,
-          escapedTitle,
-          parentPageId,
-        );
+        if (found?.id) {
+          // Fetch storage so we can correctly detect "no changes"
+          const page = await deps.client.getPageWithStorage(found.id);
+          const existingStorage = page?.body?.storage?.value ?? "";
 
-        if (underParent?.id) {
-          item.action = "update";
-          item.pageId = underParent.id;
-          item.webui = underParent._links?.webui
-            ? deps.client.toWebUrl(underParent._links.webui)
-            : undefined;
-          item.reason =
-            "Found existing page by title under chosen Parent Page.";
-          items.push(item);
-          continue;
+          const md = await deps.app.vault.read(file);
+          const newStorage = converter.convert(md, {
+            spaceKey: ctx.spaceKey,
+            fromPath: file.path,
+            resolveWikiLink,
+          });
+
+          const b = normaliseStorage(newStorage);
+
+          // Prefer last-exported storage snapshot baseline if it exists.
+          const oldStorageSnap = await snapshots.readStorageSnapshot?.(
+            file.path,
+          );
+          const a = oldStorageSnap ?? normaliseStorage(existingStorage);
+
+          const contentDiffers = a !== b;
+
+          item.pageId = String(page?.id ?? found.id);
+          item.webui = page?._links?.webui
+            ? deps.client.toWebUrl(page._links.webui)
+            : found._links?.webui
+              ? deps.client.toWebUrl(found._links.webui)
+              : undefined;
+
+          const snapMdExists = await snapshots.hasSnapshot(file.path);
+          item.hasSnapshot = snapMdExists;
+
+          if (snapMdExists) {
+            const oldMd = (await snapshots.readSnapshot(file.path)) ?? "";
+            item.diffOld = normaliseTextForDiff(oldMd);
+            item.diffNew = normaliseTextForDiff(md);
+          } else {
+            item.diffOld = normaliseTextForDiff(a);
+            item.diffNew = normaliseTextForDiff(b);
+          }
+
+          if (!contentDiffers) {
+            item.action = "skip";
+            item.selected = false;
+            item.hasDiff = false;
+            item.reason = oldStorageSnap
+              ? "Found page by title, but unchanged since last export (storage snapshot baseline)."
+              : "Found page by title, but content is unchanged (normalized).";
+          } else {
+            item.action = "update";
+            item.selected = true;
+            item.hasDiff = true;
+            item.reason = oldStorageSnap
+              ? "Found page by title; differs from last export (storage snapshot baseline)."
+              : "Found page by title; content differs (normalized).";
+          }
+        } else {
+          item.action = "create";
+          item.selected = true;
+          item.hasDiff = false;
+          item.reason = "No mapping found; no existing page by title in space.";
         }
-
-        // Not under parent — check if it exists elsewhere in space
-        const anywhere = await deps.client.searchPageByTitle(
-          spaceKey,
-          escapedTitle,
-        );
-        if (anywhere?.id) {
-          item.action = "conflict";
-          item.selected = false;
-          item.conflictPageId = anywhere.id;
-          item.conflictWebui = anywhere._links?.webui
-            ? deps.client.toWebUrl(anywhere._links.webui)
-            : undefined;
-          item.reason =
-            "A page with this title already exists in the space, but not under the chosen Parent Page.";
-          items.push(item);
-          continue;
-        }
-
-        // Not found anywhere — create under parent (normal create)
-        item.action = "create";
-        item.reason =
-          "No existing page found under Parent Page (or elsewhere in space).";
-        items.push(item);
-        continue;
-      }
-
-      // No parent set → regular space-wide title search
-      const found = await deps.client.searchPageByTitle(spaceKey, escapedTitle);
-      if (found?.id) {
-        item.action = "update";
-        item.pageId = found.id;
-        item.webui = found._links?.webui
-          ? deps.client.toWebUrl(found._links.webui)
-          : undefined;
-        item.reason = "Found existing page by title search in space.";
-        items.push(item);
-        continue;
+      } catch (e: any) {
+        item.action = "skip";
+        item.selected = false;
+        item.hasDiff = false;
+        item.reason = `Search failed: ${e?.message ?? e}`;
       }
     }
 
-    // default create
+    // belt & braces
+    if (item.action === "skip") item.selected = false;
+
     items.push(item);
   }
 

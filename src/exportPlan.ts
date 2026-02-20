@@ -1,3 +1,4 @@
+// src/exportPlan.ts
 export type PlanAction = "create" | "update" | "recreate" | "skip" | "conflict";
 
 export interface ExportPlanItem {
@@ -22,6 +23,20 @@ export interface ExportPlanItem {
 
   /** Human-readable reason for the suggested action */
   reason: string;
+
+  /** Snapshot awareness */
+  hasSnapshot?: boolean;
+
+  /** Diff availability */
+  hasDiff?: boolean;
+
+  /** For review diff */
+  diffOld?: string;
+  diffNew?: string;
+
+  /** title awareness */
+  titleChanged?: boolean;
+  existingTitle?: string;
 }
 
 /** Effective action after applying override */

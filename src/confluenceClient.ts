@@ -278,6 +278,28 @@ export class ConfluenceClient {
     return { Authorization: `Basic ${encoded}` };
   }
 
+  async getPageWithStorage(pageId: string) {
+    const root = await this.ensureRestRoot();
+
+    const res = await requestUrl({
+      url: `${root}/content/${pageId}?expand=version,body.storage`,
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        ...this.authHeaders(),
+      },
+      throw: false,
+    });
+
+    if (res.status >= 400) {
+      throw new Error(
+        `GET content/${pageId} failed: ${res.status} ${res.text}`,
+      );
+    }
+
+    return JSON.parse(res.text);
+  }
+
   private async rawCall(
     method: "GET" | "POST" | "PUT",
     url: string,

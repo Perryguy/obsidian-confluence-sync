@@ -1,21 +1,17 @@
+// src/exporter.ts
 import { App, TFile, Notice } from "obsidian";
 import type { ConfluenceSettings } from "./types";
 import type { ConfluenceClient } from "./confluenceClient";
 import { ConfluenceStorageConverter } from "./confluenceStorageConverter";
 import type { MappingService } from "./mapping";
+import { SnapshotService } from "./snapshots";
+import { normaliseStorage } from "./storageNormalise";
 
 export type ProgressFn = (text: string) => void;
 
-// Cloud/selfhost safe base for UI URLs.
-// If API gives us a relative webui (preferred), we join it to base.
-function joinUrl(base: string, relative: string): string {
-  const b = base.replace(/\/+$/, "");
-  const r = relative.startsWith("/") ? relative : `/${relative}`;
-  return `${b}${r}`;
-}
-
 export class Exporter {
   private converter = new ConfluenceStorageConverter();
+  private snapshots: SnapshotService;
 
   constructor(
     private app: App,
@@ -23,7 +19,10 @@ export class Exporter {
     private client: ConfluenceClient,
     private mapping: MappingService,
     private progress: ProgressFn,
-  ) {}
+  ) {
+    // ✅ don’t use parameter property default that references `this`
+    this.snapshots = new SnapshotService(app);
+  }
 
   async exportFromRoot(root: TFile): Promise<void> {
     await this.mapping.load();
@@ -48,7 +47,6 @@ export class Exporter {
         new Notice(`Confluence: exporting ${ordered.length} note(s)…`);
     }
 
-    // Pass 1: ensure root exists first (so we can parent children under it)
     this.progress(`Confluence: Pass 1/2 (root) ${root.basename}`);
     await this.ensurePageForFile(root, undefined);
     await this.mapping.save();
@@ -56,13 +54,11 @@ export class Exporter {
     const rootEntry = this.mapping.get(root.path);
     const rootPageId = rootEntry?.pageId;
 
-    // Parent override for non-root pages if enabled and root exists
     const parentOverride =
       this.settings.childPagesUnderRoot && rootPageId
         ? rootPageId
         : this.settings.parentPageId || undefined;
 
-    // Pass 1: remaining pages
     let idx = 0;
     const totalOthers = Math.max(0, ordered.length - 1);
 
@@ -75,20 +71,17 @@ export class Exporter {
       );
       await this.ensurePageForFile(f, parentOverride);
 
-      // Save mapping periodically (safer)
       if (idx % 5 === 0) await this.mapping.save();
     }
 
     await this.mapping.save();
 
-    // Dry run ends here (don’t attempt link rewrite)
     if (this.settings.dryRun) {
       this.progress(`Confluence: DRY RUN complete (${ordered.length} notes)`);
       if (this.settings.showProgressNotices) new Notice("Dry run complete.");
       return;
     }
 
-    // Pass 2: rewrite links + update content
     let j = 0;
     const total = ordered.length;
 
@@ -126,7 +119,6 @@ export class Exporter {
       return;
     }
 
-    // Pass 1 root first (if included)
     const rootIncluded = ordered.some((f) => f.path === root.path);
 
     if (rootIncluded) {
@@ -143,7 +135,6 @@ export class Exporter {
         ? rootPageId
         : this.settings.parentPageId || undefined;
 
-    // Pass 1: remaining selected pages
     let idx = 0;
     const others = ordered.filter((f) => f.path !== root.path);
 
@@ -164,7 +155,6 @@ export class Exporter {
       return;
     }
 
-    // Pass 2: rewrite links only for selected
     let j = 0;
     for (const f of ordered) {
       j++;
@@ -180,10 +170,11 @@ export class Exporter {
       new Notice("Confluence export complete.");
   }
 
+  // -----------------------------
   // Export set discovery
+  // -----------------------------
   private async buildExportSet(root: TFile): Promise<TFile[]> {
     const mode = this.settings.exportMode;
-
     if (mode === "backlinks")
       return this.unique([root, ...this.getBacklinks(root)]);
     if (mode === "outlinks")
@@ -198,13 +189,11 @@ export class Exporter {
 
     for (const [srcPath, destMap] of Object.entries(resolved)) {
       if (!destMap || typeof destMap !== "object") continue;
-
       if (Object.prototype.hasOwnProperty.call(destMap, targetPath)) {
         const af = this.app.vault.getAbstractFileByPath(srcPath);
         if (af instanceof TFile && af.extension === "md") out.push(af);
       }
     }
-
     return out;
   }
 
@@ -266,7 +255,9 @@ export class Exporter {
     return out;
   }
 
+  // -----------------------------
   // Pass 1: ensure page exists
+  // -----------------------------
   private async ensurePageForFile(
     file: TFile,
     parentIdOverride?: string,
@@ -280,7 +271,6 @@ export class Exporter {
     let pageId: string | undefined;
     let webui: string | undefined;
 
-    // 1) Try mapped update
     if (mapped?.pageId && this.settings.updateExisting) {
       try {
         const updated = await this.client.updatePage(
@@ -300,7 +290,6 @@ export class Exporter {
       }
     }
 
-    // 2) Try title search update
     if (!pageId && this.settings.updateExisting) {
       const found = await this.client.searchPageByTitle(
         this.settings.spaceKey,
@@ -313,7 +302,6 @@ export class Exporter {
       }
     }
 
-    // 3) Create
     if (!pageId) {
       const parentId =
         parentIdOverride ?? (this.settings.parentPageId || undefined);
@@ -327,10 +315,8 @@ export class Exporter {
       webui = created._links?.webui;
     }
 
-    // ✅ Guarantee pageId exists from here
     if (!pageId) throw new Error(`Failed to resolve pageId for ${file.path}`);
 
-    // 4) Save mapping
     this.mapping.set({
       filePath: file.path,
       pageId,
@@ -339,7 +325,6 @@ export class Exporter {
       updatedAt: new Date().toISOString(),
     });
 
-    // 4.5) Apply Confluence labels from Obsidian tags
     try {
       const { extractObsidianTags, toConfluenceLabel } = await import("./tags");
       const tags = extractObsidianTags(md)
@@ -351,7 +336,6 @@ export class Exporter {
       new Notice(`Label sync failed for "${title}": ${e?.message ?? e}`);
     }
 
-    // 5) Upload embeds ALWAYS
     try {
       await this.uploadEmbedsForPage(file, pageId);
     } catch (e: any) {
@@ -369,17 +353,79 @@ export class Exporter {
     await uploadEmbeddedImages(this.app, this.client, pageId, file, md);
   }
 
-  // Pass 2: rewrite wikilinks using mapping, then update
+  // -----------------------------
+  // Pass 2: update content + title
+  // -----------------------------
   private async updatePageContentWithLinks(file: TFile): Promise<void> {
     const entry = this.mapping.get(file.path);
     if (!entry?.pageId) return;
 
-    const title = file.basename;
+    const desiredTitle = file.basename;
     const md = await this.app.vault.read(file);
-    const storage = this.converter.convert(md, this.makeCtx(file));
+    const newStorageRaw = this.converter.convert(md, this.makeCtx(file));
+    const newStorageNorm = normaliseStorage(newStorageRaw);
+
+    // Fetch current Confluence page (storage + title)
+    let existingTitle = "";
+    let existingStorageRaw = "";
+    try {
+      const existing = await this.client.getPageWithStorage(entry.pageId);
+      existingTitle = String(existing?.title ?? "");
+      existingStorageRaw = existing?.body?.storage?.value ?? "";
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes(" 404")) {
+        console.warn(
+          `[Confluence] Page missing during pass2 (mapping stale). Removing mapping: ${entry.pageId} for ${file.path}`,
+        );
+        this.mapping.remove(file.path);
+        return;
+      }
+      throw e;
+    }
+
+    const existingStorageNorm = normaliseStorage(existingStorageRaw);
+
+    // Prefer last-exported storage snapshot as baseline to avoid Confluence canonicalisation diffs.
+    let baselineStorageNorm: string | null = null;
+    try {
+      baselineStorageNorm = await this.snapshots.readStorageSnapshot(file.path);
+    } catch {
+      baselineStorageNorm = null;
+    }
+
+    const bodyUnchanged =
+      (baselineStorageNorm ?? existingStorageNorm) === newStorageNorm;
+
+    const titleUnchanged = (existingTitle || "").trim() === desiredTitle.trim();
+
+    // ✅ Skip ONLY if both title and body unchanged
+    if (bodyUnchanged && titleUnchanged) {
+      console.log(`[Confluence] Skipping update (no changes): ${file.path}`);
+      return;
+    }
 
     try {
-      await this.client.updatePage(entry.pageId, title, storage);
+      await this.client.updatePage(entry.pageId, desiredTitle, newStorageRaw);
+
+      // Snapshot best-effort (markdown + storage snapshot)
+      try {
+        await this.snapshots.writeSnapshot(file.path, md);
+      } catch (e: any) {
+        console.warn(
+          `[Confluence] Snapshot write failed for ${file.path} (continuing):`,
+          e,
+        );
+      }
+
+      try {
+        await this.snapshots.writeStorageSnapshot(file.path, newStorageNorm);
+      } catch (e: any) {
+        console.warn(
+          `[Confluence] Storage snapshot write failed for ${file.path} (continuing):`,
+          e,
+        );
+      }
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (msg.includes(" 404")) {
@@ -394,7 +440,7 @@ export class Exporter {
 
     this.mapping.set({
       ...entry,
-      title,
+      title: desiredTitle,
       updatedAt: new Date().toISOString(),
     });
   }
@@ -414,7 +460,6 @@ export class Exporter {
             const mapped = this.mapping.get(dest.path);
             return { title: mapped?.title ?? dest.basename };
           }
-
           return { title: dest.name };
         }
 

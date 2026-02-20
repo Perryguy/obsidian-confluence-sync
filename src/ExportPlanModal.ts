@@ -1,5 +1,5 @@
+// src/ExportPlanModal.ts
 import { App, Modal, Setting, Notice } from "obsidian";
-import type { TFile } from "obsidian";
 import type { ExportPlanItem, PlanAction } from "./exportPlan";
 import { effectiveAction } from "./exportPlan";
 
@@ -16,22 +16,17 @@ function extractPageIdFromInput(raw: string): string | undefined {
   const s = (raw ?? "").trim();
   if (!s) return undefined;
 
-  // If it's just digits, assume it's a pageId
   if (/^\d+$/.test(s)) return s;
 
-  // Try to extract ".../pages/<id>/..." (common)
   const m1 = s.match(/\/pages\/(\d+)\b/);
   if (m1?.[1]) return m1[1];
 
-  // Try "pageId=123"
   const m2 = s.match(/[?&]pageId=(\d+)\b/);
   if (m2?.[1]) return m2[1];
 
-  // Try ".../content/<id>" (some APIs/links)
   const m3 = s.match(/\/content\/(\d+)\b/);
   if (m3?.[1]) return m3[1];
 
-  // Last resort: pick first long digit run
   const m4 = s.match(/\b(\d{6,})\b/);
   if (m4?.[1]) return m4[1];
 
@@ -82,7 +77,6 @@ export class ExportPlanModal extends Modal {
     // ---------- Export Context ----------
     contentEl.createEl("h3", { text: "Target" });
 
-    // Space Key
     new Setting(contentEl)
       .setName("Space Key")
       .setDesc("The Confluence space key (e.g. ENG).")
@@ -95,23 +89,20 @@ export class ExportPlanModal extends Modal {
           }),
       );
 
-    // Parent page (per export)
     new Setting(contentEl)
       .setName("Parent Page (optional)")
       .setDesc(
-        "Paste a Parent Page ID or a Confluence page URL. If set, plan will detect conflicts under this parent.",
+        "Paste a Parent Page ID or a Confluence page URL. If set, plan can detect conflicts under this parent.",
       )
       .addText((t) =>
         t
           .setPlaceholder("Page ID or URL")
           .setValue(this.ctx.parentPageId ?? "")
           .onChange((v) => {
-            const id = extractPageIdFromInput(v);
-            this.ctx.parentPageId = id;
+            this.ctx.parentPageId = extractPageIdFromInput(v);
           }),
       );
 
-    // Rebuild plan button
     new Setting(contentEl).addButton((b) =>
       b
         .setButtonText("Rebuild plan")
@@ -122,8 +113,8 @@ export class ExportPlanModal extends Modal {
               text: "Rebuilding plan…",
             });
             const newItems = await this.rebuildPlan(this.ctx);
-            this.items = newItems;
             loading.remove();
+            this.items = newItems;
             this.render();
           } catch (e: any) {
             console.error(e);
@@ -161,24 +152,24 @@ export class ExportPlanModal extends Modal {
       )
       .addButton((b) =>
         b.setButtonText("Select creates").onClick(() => {
-          this.items.forEach((i) => {
-            i.selected = effectiveAction(i) === "create";
-          });
+          this.items.forEach(
+            (i) => (i.selected = effectiveAction(i) === "create"),
+          );
           this.render();
         }),
       )
       .addButton((b) =>
         b.setButtonText("Select updates").onClick(() => {
-          this.items.forEach((i) => {
-            i.selected = effectiveAction(i) === "update";
-          });
+          this.items.forEach(
+            (i) => (i.selected = effectiveAction(i) === "update"),
+          );
           this.render();
         }),
       );
 
     contentEl.createEl("hr");
 
-    // ---------- Item list ----------
+    // ---------- Items ----------
     for (const item of this.items) {
       const row = contentEl.createDiv({ cls: "confluence-export-row" });
 
@@ -206,6 +197,7 @@ export class ExportPlanModal extends Modal {
 
       if (item.pageId)
         details.createEl("div", { text: `Target pageId: ${item.pageId}` });
+
       if (item.webui) {
         const a = details.createEl("a", {
           text: "Open target in Confluence",
@@ -215,16 +207,32 @@ export class ExportPlanModal extends Modal {
         a.rel = "noopener";
       }
 
+      // ✅ Diff button for update/recreate (uses precomputed diffOld/diffNew from planBuilder)
+      if ((eff === "update" || eff === "recreate") && item.hasDiff) {
+        const diffBtn = details.createEl("button", { text: "Diff" });
+        diffBtn.onclick = async () => {
+          const { DiffModal } = await import("./diffModal");
+
+          const oldText = item.diffOld ?? "";
+          const newText = item.diffNew ?? "";
+
+          new DiffModal(this.app, item.title, oldText, newText).open();
+        };
+      }
+
+      // Conflict UI (if you have conflict logic in ExportPlanItem)
       if (eff === "conflict") {
         details.createEl("div", {
           text: "Conflict detected:",
           cls: "confluence-muted",
         });
 
-        if (item.conflictPageId)
+        if (item.conflictPageId) {
           details.createEl("div", {
             text: `Existing pageId: ${item.conflictPageId}`,
           });
+        }
+
         if (item.conflictWebui) {
           const a2 = details.createEl("a", {
             text: "Open conflicting page",
@@ -234,7 +242,6 @@ export class ExportPlanModal extends Modal {
           a2.rel = "noopener";
         }
 
-        // Override dropdown for conflicts: Skip / Update existing / Create anyway
         new Setting(details)
           .setName("Resolve conflict")
           .setDesc("Choose what to do for this item.")
@@ -242,23 +249,13 @@ export class ExportPlanModal extends Modal {
             d.addOption("", "Default (Conflict → not exported)");
             d.addOption("skip", "Skip");
             d.addOption("update", "Update existing page (in place)");
-            d.addOption("create", "Create anyway (may create duplicate title)");
+            d.addOption("create", "Create anyway (may duplicate title)");
             d.setValue(item.overrideAction ?? "");
             d.onChange((v) => {
               item.overrideAction = (v || undefined) as PlanAction | undefined;
 
-              // If user chooses update/create, enable selection automatically
               const eff2 = effectiveAction(item);
-              if (
-                eff2 === "update" ||
-                eff2 === "create" ||
-                eff2 === "recreate"
-              ) {
-                item.selected = true;
-              } else {
-                item.selected = false;
-              }
-
+              item.selected = eff2 !== "skip" && eff2 !== "conflict";
               this.render();
             });
           });
@@ -268,6 +265,7 @@ export class ExportPlanModal extends Modal {
         text: `Why: ${item.reason}`,
         cls: "confluence-muted",
       });
+
       row.createEl("hr");
     }
 
@@ -278,11 +276,11 @@ export class ExportPlanModal extends Modal {
       text: "Export selected",
       cls: "mod-cta",
     });
+
     exportBtn.onclick = async () => {
       const selected = this.items
         .filter((i) => i.selected)
         .map((i) => {
-          // apply override by collapsing into action so downstream code sees it
           i.action = effectiveAction(i);
           i.overrideAction = undefined;
           return i;

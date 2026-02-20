@@ -10,3 +10,61 @@
 .confluence-export-row-top { display: flex; align-items: center; gap: 6px; }
 .confluence-export-row-details { margin-left: 22px; display: grid; gap: 4px; }
 .confluence-export-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+
+/* Diff container */
+.confluence-diff {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  line-height: 1.35;
+  background: var(--background-primary);
+}
+
+/* Each row */
+.confluence-diff-row {
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  gap: 8px;
+  padding: 2px 8px;
+  white-space: pre; /* preserve spaces */
+}
+
+/* Prefix column */
+.confluence-diff-prefix {
+  opacity: 0.8;
+  text-align: right;
+}
+
+/* Text column */
+.confluence-diff-text {
+  white-space: pre-wrap; /* preserves whitespace but wraps long lines */
+  word-break: break-word;
+}
+
+/* Context/add/del backgrounds */
+.confluence-diff-context {
+  background: transparent;
+}
+
+.confluence-diff-added {
+  background: rgba(0, 200, 0, 0.12);
+}
+
+.confluence-diff-removed {
+  background: rgba(255, 0, 0, 0.10);
+}
+
+/* Inline highlights (optional, if you add word-level diff) */
+.confluence-diff-inline-added {
+  background: rgba(0, 200, 0, 0.25);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.confluence-diff-inline-removed {
+  background: rgba(255, 0, 0, 0.20);
+  border-radius: 3px;
+  padding: 0 2px;
+}
