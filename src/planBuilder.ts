@@ -113,9 +113,14 @@ export async function buildExportPlan(
           const oldMd = (await snapshots.readSnapshot(file.path)) ?? "";
           item.diffOld = normaliseTextForDiff(oldMd);
           item.diffNew = normaliseTextForDiff(md);
+          item.hasDiff = true;
         } else {
-          item.diffOld = normaliseTextForDiff(a);
-          item.diffNew = normaliseTextForDiff(b);
+          // No snapshot -> don't lie with HTML noise.
+          item.diffOld = "";
+          item.diffNew = normaliseTextForDiff(md);
+          item.hasDiff = true; // still allow diff so user sees "new content"
+          item.reason +=
+            " (No markdown snapshot yet — showing current note only.)";
         }
 
         // Decide action

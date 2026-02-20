@@ -216,7 +216,13 @@ export class ExportPlanModal extends Modal {
           const oldText = item.diffOld ?? "";
           const newText = item.diffNew ?? "";
 
-          new DiffModal(this.app, item.title, oldText, newText).open();
+          // If we have no baseline, show a friendly header in "old" so it's obvious
+          const oldForUi =
+            oldText.trim().length === 0
+              ? "⟵ No previous markdown snapshot for this note.\nThis is the current content:\n"
+              : oldText;
+
+          new DiffModal(this.app, item.title, oldForUi, newText).open();
         };
       }
 

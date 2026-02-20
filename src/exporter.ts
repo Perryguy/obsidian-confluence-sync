@@ -20,7 +20,6 @@ export class Exporter {
     private mapping: MappingService,
     private progress: ProgressFn,
   ) {
-    // ✅ don’t use parameter property default that references `this`
     this.snapshots = new SnapshotService(app);
   }
 
@@ -264,7 +263,8 @@ export class Exporter {
   ): Promise<void> {
     const title = file.basename;
     const md = await this.app.vault.read(file);
-    const storage = this.converter.convert(md, this.makeCtx(file));
+    const storageRaw = this.converter.convert(md, this.makeCtx(file));
+    const storageNorm = normaliseStorage(storageRaw);
 
     const mapped = this.mapping.get(file.path);
 
@@ -276,7 +276,7 @@ export class Exporter {
         const updated = await this.client.updatePage(
           mapped.pageId,
           title,
-          storage,
+          storageRaw,
         );
         pageId = updated.id;
         webui = updated._links?.webui;
@@ -296,7 +296,11 @@ export class Exporter {
         title,
       );
       if (found) {
-        const updated = await this.client.updatePage(found.id, title, storage);
+        const updated = await this.client.updatePage(
+          found.id,
+          title,
+          storageRaw,
+        );
         pageId = updated.id;
         webui = updated._links?.webui;
       }
@@ -309,7 +313,7 @@ export class Exporter {
         this.settings.spaceKey,
         title,
         parentId,
-        storage,
+        storageRaw,
       );
       pageId = created.id;
       webui = created._links?.webui;
@@ -324,6 +328,27 @@ export class Exporter {
       webui,
       updatedAt: new Date().toISOString(),
     });
+
+    // ✅ Write snapshots in pass 1 (so diffs work immediately on next plan build)
+    if (!this.settings.dryRun) {
+      try {
+        await this.snapshots.writeSnapshot(file.path, md);
+      } catch (e: any) {
+        console.warn(
+          `[Confluence] Snapshot write failed for ${file.path} (continuing):`,
+          e,
+        );
+      }
+
+      try {
+        await this.snapshots.writeStorageSnapshot(file.path, storageNorm);
+      } catch (e: any) {
+        console.warn(
+          `[Confluence] Storage snapshot write failed for ${file.path} (continuing):`,
+          e,
+        );
+      }
+    }
 
     try {
       const { extractObsidianTags, toConfluenceLabel } = await import("./tags");
@@ -362,6 +387,7 @@ export class Exporter {
 
     const desiredTitle = file.basename;
     const md = await this.app.vault.read(file);
+
     const newStorageRaw = this.converter.convert(md, this.makeCtx(file));
     const newStorageNorm = normaliseStorage(newStorageRaw);
 
@@ -386,7 +412,7 @@ export class Exporter {
 
     const existingStorageNorm = normaliseStorage(existingStorageRaw);
 
-    // Prefer last-exported storage snapshot as baseline to avoid Confluence canonicalisation diffs.
+    // Prefer last-exported storage snapshot as baseline
     let baselineStorageNorm: string | null = null;
     try {
       baselineStorageNorm = await this.snapshots.readStorageSnapshot(file.path);
@@ -399,16 +425,35 @@ export class Exporter {
 
     const titleUnchanged = (existingTitle || "").trim() === desiredTitle.trim();
 
-    // ✅ Skip ONLY if both title and body unchanged
     if (bodyUnchanged && titleUnchanged) {
       console.log(`[Confluence] Skipping update (no changes): ${file.path}`);
+
+      // ✅ Still refresh snapshots so the diff UX works and baseline stays current
+      try {
+        await this.snapshots.writeSnapshot(file.path, md);
+      } catch (e: any) {
+        console.warn(
+          `[Confluence] Snapshot write failed for ${file.path} (continuing):`,
+          e,
+        );
+      }
+
+      try {
+        await this.snapshots.writeStorageSnapshot(file.path, newStorageNorm);
+      } catch (e: any) {
+        console.warn(
+          `[Confluence] Storage snapshot write failed for ${file.path} (continuing):`,
+          e,
+        );
+      }
+
       return;
     }
 
     try {
       await this.client.updatePage(entry.pageId, desiredTitle, newStorageRaw);
 
-      // Snapshot best-effort (markdown + storage snapshot)
+      // Snapshot best-effort
       try {
         await this.snapshots.writeSnapshot(file.path, md);
       } catch (e: any) {

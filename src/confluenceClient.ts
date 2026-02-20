@@ -1,3 +1,4 @@
+// src/confluenceClient.ts
 import { requestUrl, type RequestUrlResponse } from "obsidian";
 
 type ConfluenceMode = "auto" | "cloud" | "selfHosted";
@@ -19,6 +20,7 @@ export interface ConfluenceLinks {
   webui?: string;
   tinyui?: string;
   self?: string;
+  download?: string; // attachments often include this
 }
 
 export interface ConfluenceContent {
@@ -26,6 +28,18 @@ export interface ConfluenceContent {
   type?: string;
   title: string;
   _links?: ConfluenceLinks;
+  version?: { number: number };
+}
+
+export interface ConfluenceAttachment {
+  id: string;
+  title: string; // filename
+  _links?: ConfluenceLinks;
+  extensions?: {
+    fileSize?: number;
+    mediaType?: string;
+    comment?: string;
+  };
   version?: { number: number };
 }
 
@@ -38,7 +52,6 @@ function ensureLeadingSlash(s: string): string {
 }
 
 function escapeCqlStringLiteral(value: string): string {
-  // Escape backslashes first, then double quotes, to avoid creating unescaped quotes.
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
@@ -157,11 +170,32 @@ export class ConfluenceClient {
       );
     }
 
-    // If HTML comes back (SSO/proxy), show it clearly
     const t = (res.text ?? "").trimStart();
     if (t.startsWith("<")) {
       throw new Error(
         `GET content/${pageId} returned HTML (login/proxy). First 200 chars: ${t.slice(0, 200)}`,
+      );
+    }
+
+    return JSON.parse(res.text);
+  }
+
+  async getPageWithStorage(pageId: string) {
+    const root = await this.ensureRestRoot();
+
+    const res = await requestUrl({
+      url: `${root}/content/${pageId}?expand=version,body.storage`,
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        ...this.authHeaders(),
+      },
+      throw: false,
+    });
+
+    if (res.status >= 400) {
+      throw new Error(
+        `GET content/${pageId} failed: ${res.status} ${res.text}`,
       );
     }
 
@@ -206,8 +240,103 @@ export class ConfluenceClient {
     const url = `${root}/content/${pageId}/label`;
 
     const body = labels.map((name) => ({ prefix: "global", name }));
-
     await this.rawCall("POST", url, body);
+  }
+
+  // ---------------------------
+  // Attachments helpers (NEW)
+  // ---------------------------
+
+  /**
+   * Find the latest attachment on a page by filename.
+   * Returns null if not found.
+   */
+  async getAttachmentByFilename(
+    pageId: string,
+    filename: string,
+  ): Promise<ConfluenceAttachment | null> {
+    const root = await this.ensureRestRoot();
+
+    // Confluence returns attachments under:
+    // /content/{id}/child/attachment?filename=...&expand=version,extensions,_links
+    const url =
+      `${root}/content/${pageId}/child/attachment` +
+      `?filename=${encodeURIComponent(filename)}` +
+      `&expand=version,extensions,_links&limit=1`;
+
+    const res = await this.rawCall("GET", url);
+    const json = this.safeJson(res.text);
+    const r = json?.results?.[0];
+    if (!r?.id) return null;
+
+    return {
+      id: String(r.id),
+      title: String(r.title ?? filename),
+      _links: r._links,
+      extensions: r.extensions,
+      version: r.version,
+    };
+  }
+
+  /**
+   * Download attachment bytes using its _links.download.
+   * Works for both Cloud and DC as long as auth headers are valid.
+   */
+  async downloadAttachmentBytes(
+    att: ConfluenceAttachment,
+  ): Promise<ArrayBuffer> {
+    const dl = att?._links?.download;
+    if (!dl) throw new Error("Attachment has no _links.download");
+
+    const url = this.toWebUrl(dl);
+
+    // We must not force JSON headers here.
+    const res = await requestUrl({
+      url,
+      method: "GET",
+      headers: {
+        ...this.authHeaders(),
+        // Accept anything (images, binary)
+        Accept: "*/*",
+      },
+      throw: false,
+    });
+
+    if (res.status >= 400) {
+      throw new Error(`GET ${url} failed: ${res.status} ${res.text}`);
+    }
+
+    // requestUrl returns ArrayBuffer in .arrayBuffer (Obsidian API)
+    if (res.arrayBuffer instanceof ArrayBuffer) return res.arrayBuffer;
+
+    // Fallback: if not provided, attempt to decode from text (rare)
+    // This won't be correct for binary but keeps errors explicit.
+    throw new Error("Attachment download did not return arrayBuffer");
+  }
+
+  /**
+   * Convenience: download by attachment id via REST endpoint.
+   * Not always necessary, but handy.
+   */
+  async downloadAttachmentBytesById(
+    attachmentId: string,
+  ): Promise<ArrayBuffer> {
+    const root = await this.ensureRestRoot();
+
+    // Expand _links so we can read download path
+    const res = await this.rawCall(
+      "GET",
+      `${root}/content/${attachmentId}?expand=_links,extensions,version`,
+    );
+    const json = this.safeJson(res.text);
+    const att: ConfluenceAttachment = {
+      id: String(json?.id ?? attachmentId),
+      title: String(json?.title ?? ""),
+      _links: json?._links,
+      extensions: json?.extensions,
+      version: json?.version,
+    };
+    return await this.downloadAttachmentBytes(att);
   }
 
   // ---------------------------
@@ -278,28 +407,6 @@ export class ConfluenceClient {
     return { Authorization: `Basic ${encoded}` };
   }
 
-  async getPageWithStorage(pageId: string) {
-    const root = await this.ensureRestRoot();
-
-    const res = await requestUrl({
-      url: `${root}/content/${pageId}?expand=version,body.storage`,
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        ...this.authHeaders(),
-      },
-      throw: false,
-    });
-
-    if (res.status >= 400) {
-      throw new Error(
-        `GET content/${pageId} failed: ${res.status} ${res.text}`,
-      );
-    }
-
-    return JSON.parse(res.text);
-  }
-
   private async rawCall(
     method: "GET" | "POST" | "PUT",
     url: string,
@@ -315,14 +422,12 @@ export class ConfluenceClient {
     if (jsonBody) headers["Content-Type"] = "application/json";
 
     if (isWrite) {
-      // XSRF bypass headers (some DC/proxy combos are picky)
       headers["X-Atlassian-Token"] = "no-check";
       headers["X-Requested-With"] = "XMLHttpRequest";
       headers["Origin"] = "app://obsidian.md";
       headers["Referer"] = this.cfg.baseUrl;
     }
 
-    // Debug: confirm headers actually set (don’t log auth)
     const debugHeaders = { ...headers };
     delete (debugHeaders as any).Authorization;
     console.log("[Confluence] rawCall", method, url, debugHeaders);
