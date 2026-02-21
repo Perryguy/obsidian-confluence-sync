@@ -26,6 +26,12 @@ export interface ExportReviewResult {
   hierarchyPreviewLines: string[];
 }
 
+// Minimal local shape so we can pass selectedItems through to exporter without importing ExportPlanItem
+type SelectedPlanItem = {
+  filePath: string;
+  applyLabelChanges?: boolean;
+};
+
 export default class ConfluenceSyncPlugin extends Plugin {
   settings: ConfluenceSettings = DEFAULT_SETTINGS;
 
@@ -56,10 +62,7 @@ export default class ConfluenceSyncPlugin extends Plugin {
     try {
       await this.mapping.load();
     } catch (e) {
-      console.warn(
-        "[Confluence] Mapping load failed on startup (continuing):",
-        e,
-      );
+      console.warn("[Confluence] Mapping load failed on startup (continuing):", e);
       new Notice(
         "Confluence Sync: mapping could not be loaded. Exports may recreate pages.",
       );
@@ -175,9 +178,7 @@ export default class ConfluenceSyncPlugin extends Plugin {
           await this.mapping.load();
           await this.mapping.reset();
 
-          new Notice(
-            "Confluence mapping reset. Next export may recreate pages.",
-          );
+          new Notice("Confluence mapping reset. Next export may recreate pages.");
         } catch (e: any) {
           console.error(e);
           new Notice(`Reset failed: ${e?.message ?? e}`);
@@ -213,13 +214,17 @@ export default class ConfluenceSyncPlugin extends Plugin {
         ): Promise<ExportReviewResult> => {
           await this.mapping.load();
 
-          // Plan actions/diffs (create/update/etc) — buildExportPlan now expects 4 args
+          // Plan actions/diffs (create/update/etc)
           const items = await buildExportPlan(
             {
               app: this.app,
               client: this.client,
               mapping: this.mapping,
-              settings: { updateExisting: this.settings.updateExisting },
+              settings: {
+                updateExisting: this.settings.updateExisting,
+                includeInlineTagsForLabels:
+                  this.settings.includeInlineTagsForLabels ?? true,
+              },
             },
             filesToExport,
             {
@@ -240,8 +245,6 @@ export default class ConfluenceSyncPlugin extends Plugin {
             ctx.hierarchyManyToManyPolicy,
           );
 
-          // NOTE: use the name your HierarchyResult actually exposes
-          // Your TS error suggests it's `parentPathByPath`
           const lines = renderHierarchyPreview(
             root,
             (hier as any).parentPathByPath,
@@ -266,8 +269,14 @@ export default class ConfluenceSyncPlugin extends Plugin {
           initial,
           initialCtx,
           rebuildPlan,
-          async (selectedItems: any[], ctx: ExportReviewContext) => {
-            const selectedPaths = new Set(selectedItems.map((i) => i.filePath));
+          async (selectedItemsRaw: any[], ctx: ExportReviewContext) => {
+            // ✅ IMPORTANT: pass selected ITEMS (not Set of paths) so exporter can respect applyLabelChanges
+            const selectedItems: SelectedPlanItem[] = (selectedItemsRaw ?? []).map(
+              (i) => ({
+                filePath: i.filePath,
+                applyLabelChanges: i.applyLabelChanges !== false,
+              }),
+            );
 
             // Temporary override for this run (exporter reads from settings)
             const prevSpace = this.settings.spaceKey;
@@ -277,10 +286,9 @@ export default class ConfluenceSyncPlugin extends Plugin {
             this.settings.parentPageId = ctx.parentPageId ?? "";
 
             try {
-              // If your exporter has a 3rd arg for per-run hierarchy options, pass it:
               await (this.exporter as any).exportFromRootSelected(
                 root,
-                selectedPaths,
+                selectedItems,
                 {
                   hierarchyMode: ctx.hierarchyMode,
                   hierarchyManyToManyPolicy: ctx.hierarchyManyToManyPolicy,
@@ -382,9 +390,7 @@ function renderHierarchyPreview(
   const lines: string[] = [];
   const walk = (path: string, depth: number) => {
     const indent = depth === 0 ? "" : "  ".repeat(depth);
-    lines.push(
-      `${indent}- ${path === root.path ? root.basename : basename(path)}`,
-    );
+    lines.push(`${indent}- ${path === root.path ? root.basename : basename(path)}`);
     const kids = children.get(path) ?? [];
     for (const k of kids) walk(k, depth + 1);
   };

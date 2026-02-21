@@ -1,9 +1,17 @@
+// src/stripTags.ts
 export function stripInlineTagsFromMarkdown(markdown: string): string {
   if (!markdown) return "";
 
-  // Remove frontmatter block entirely (optional, but often desired)
-  // If you DO want frontmatter content in Confluence, delete this block.
-  markdown = markdown.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "");
+  // Normalise BOM + line endings (Windows CRLF etc.)
+  markdown = markdown
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+
+  // Remove YAML frontmatter at top of file.
+  // Allows leading whitespace/blank lines before the first ---.
+  // (If you DO want frontmatter in Confluence, delete this block.)
+  markdown = markdown.replace(/^\s*---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, "");
 
   // Remove fenced code blocks and inline code temporarily by tokenizing
   const codeSpans: string[] = [];
@@ -29,8 +37,8 @@ export function stripInlineTagsFromMarkdown(markdown: string): string {
     },
   );
 
-  // Tidy up double spaces created by removals
-  markdown = markdown.replace(/[ \t]{2,}/g, " ");
+  // NOTE: Do NOT “tidy up” whitespace globally.
+  // Collapsing spaces can change markdown meaning and create phantom diffs.
 
   return markdown;
 }

@@ -15,6 +15,8 @@ export type ManyToManyPolicy =
   | "closestToRoot"
   | "preferFolderIndex";
 
+export type LabelSyncMode = "addOnly" | "strict";
+
 export interface ConfluenceSettings {
   baseUrl: string;
   mode: ConfluenceMode;
@@ -45,17 +47,8 @@ export interface ConfluenceSettings {
 
   /** If true, move existing pages to match the chosen hierarchy */
   movePagesToMatchHierarchy: boolean;
-}
 
-export interface MappingEntry {
-  filePath: string; // Obsidian path
-  pageId: string; // Confluence content id
-  title: string; // Confluence page title
-  webui?: string; // Relative UI link returned by API (preferred for linking)
-  updatedAt?: string;
-}
-
-export interface MappingStore {
-  version: number;
-  entries: Record<string, MappingEntry>; // key = filePath
+  /** Label behaviour */
+  labelSyncMode: LabelSyncMode; // "addOnly" (safe default) | "strict" (removes extra labels)
+  includeInlineTagsForLabels: boolean; // keep inline #tags as labels (default true)
 }

@@ -20,7 +20,7 @@ export interface ConfluenceLinks {
   webui?: string;
   tinyui?: string;
   self?: string;
-  download?: string; // attachments often include this
+  download?: string;
 }
 
 export interface ConfluenceContent {
@@ -33,7 +33,7 @@ export interface ConfluenceContent {
 
 export interface ConfluenceAttachment {
   id: string;
-  title: string; // filename
+  title: string;
   _links?: ConfluenceLinks;
   extensions?: {
     fileSize?: number;
@@ -59,10 +59,6 @@ export class ConfluenceClient {
   private restRootCache?: string;
 
   constructor(private cfg: ConfluenceClientConfig) {}
-
-  // ---------------------------
-  // Public API used by exporter
-  // ---------------------------
 
   async ping(): Promise<string> {
     const root = await this.ensureRestRoot();
@@ -155,41 +151,13 @@ export class ConfluenceClient {
     };
   }
 
-  async getPage(pageId: string): Promise<any> {
-    const root = await this.ensureRestRoot();
-    const res = await requestUrl({
-      url: `${root}/content/${pageId}?expand=version,_links,ancestors,space`,
-      method: "GET",
-      headers: { Accept: "application/json", ...this.authHeaders() },
-      throw: false,
-    });
-
-    if (res.status >= 400) {
-      throw new Error(
-        `GET content/${pageId} failed: ${res.status} ${res.text}`,
-      );
-    }
-
-    const t = (res.text ?? "").trimStart();
-    if (t.startsWith("<")) {
-      throw new Error(
-        `GET content/${pageId} returned HTML (login/proxy). First 200 chars: ${t.slice(0, 200)}`,
-      );
-    }
-
-    return JSON.parse(res.text);
-  }
-
   async getPageWithStorage(pageId: string) {
     const root = await this.ensureRestRoot();
 
     const res = await requestUrl({
       url: `${root}/content/${pageId}?expand=version,body.storage`,
       method: "GET",
-      headers: {
-        Accept: "application/json",
-        ...this.authHeaders(),
-      },
+      headers: { Accept: "application/json", ...this.authHeaders() },
       throw: false,
     });
 
@@ -234,31 +202,66 @@ export class ConfluenceClient {
     }
   }
 
+  // ---------------------------
+  // Labels
+  // ---------------------------
+
+  async getLabels(pageId: string): Promise<string[]> {
+    const root = await this.ensureRestRoot();
+    const url = `${root}/content/${pageId}/label?limit=200`;
+
+    const res = await this.rawCall("GET", url);
+    const json = this.safeJson(res.text);
+
+    const out: string[] = [];
+    for (const r of json?.results ?? []) {
+      const name = String(r?.name ?? "").trim();
+      const prefix = String(r?.prefix ?? "").trim();
+      if (!name) continue;
+      // treat global/system similarly; you can filter if you only want global
+      if (prefix === "global" || prefix === "" || prefix === "my")
+        out.push(name);
+    }
+    return out;
+  }
+
   async addLabels(pageId: string, labels: string[]): Promise<void> {
-    if (labels.length === 0) return;
+    const list = (labels ?? []).map((s) => (s ?? "").trim()).filter(Boolean);
+    if (list.length === 0) return;
+
     const root = await this.ensureRestRoot();
     const url = `${root}/content/${pageId}/label`;
+    const body = list.map((name) => ({ prefix: "global", name }));
 
-    const body = labels.map((name) => ({ prefix: "global", name }));
     await this.rawCall("POST", url, body);
   }
 
+  async removeLabels(pageId: string, labels: string[]): Promise<void> {
+    const list = (labels ?? []).map((s) => (s ?? "").trim()).filter(Boolean);
+    if (list.length === 0) return;
+
+    const root = await this.ensureRestRoot();
+
+    // Confluence supports deleting labels via:
+    // DELETE /content/{id}/label?name=xxx&prefix=global
+    // We do one call per label (simpler, predictable).
+    for (const name of list) {
+      const url =
+        `${root}/content/${pageId}/label` +
+        `?name=${encodeURIComponent(name)}&prefix=global`;
+      await this.rawCall("DELETE", url);
+    }
+  }
+
   // ---------------------------
-  // Attachments helpers (NEW)
+  // Attachments helpers (unchanged)
   // ---------------------------
 
-  /**
-   * Find the latest attachment on a page by filename.
-   * Returns null if not found.
-   */
   async getAttachmentByFilename(
     pageId: string,
     filename: string,
   ): Promise<ConfluenceAttachment | null> {
     const root = await this.ensureRestRoot();
-
-    // Confluence returns attachments under:
-    // /content/{id}/child/attachment?filename=...&expand=version,extensions,_links
     const url =
       `${root}/content/${pageId}/child/attachment` +
       `?filename=${encodeURIComponent(filename)}` +
@@ -278,10 +281,6 @@ export class ConfluenceClient {
     };
   }
 
-  /**
-   * Download attachment bytes using its _links.download.
-   * Works for both Cloud and DC as long as auth headers are valid.
-   */
   async downloadAttachmentBytes(
     att: ConfluenceAttachment,
   ): Promise<ArrayBuffer> {
@@ -290,15 +289,10 @@ export class ConfluenceClient {
 
     const url = this.toWebUrl(dl);
 
-    // We must not force JSON headers here.
     const res = await requestUrl({
       url,
       method: "GET",
-      headers: {
-        ...this.authHeaders(),
-        // Accept anything (images, binary)
-        Accept: "*/*",
-      },
+      headers: { ...this.authHeaders(), Accept: "*/*" },
       throw: false,
     });
 
@@ -306,24 +300,15 @@ export class ConfluenceClient {
       throw new Error(`GET ${url} failed: ${res.status} ${res.text}`);
     }
 
-    // requestUrl returns ArrayBuffer in .arrayBuffer (Obsidian API)
     if (res.arrayBuffer instanceof ArrayBuffer) return res.arrayBuffer;
-
-    // Fallback: if not provided, attempt to decode from text (rare)
-    // This won't be correct for binary but keeps errors explicit.
     throw new Error("Attachment download did not return arrayBuffer");
   }
 
-  /**
-   * Convenience: download by attachment id via REST endpoint.
-   * Not always necessary, but handy.
-   */
   async downloadAttachmentBytesById(
     attachmentId: string,
   ): Promise<ArrayBuffer> {
     const root = await this.ensureRestRoot();
 
-    // Expand _links so we can read download path
     const res = await this.rawCall(
       "GET",
       `${root}/content/${attachmentId}?expand=_links,extensions,version`,
@@ -340,7 +325,7 @@ export class ConfluenceClient {
   }
 
   // ---------------------------
-  // REST root detection
+  // REST root detection (unchanged)
   // ---------------------------
 
   async ensureRestRoot(): Promise<string> {
@@ -408,11 +393,12 @@ export class ConfluenceClient {
   }
 
   private async rawCall(
-    method: "GET" | "POST" | "PUT",
+    method: "GET" | "POST" | "PUT" | "DELETE",
     url: string,
     jsonBody?: any,
   ): Promise<RequestUrlResponse> {
-    const isWrite = method === "POST" || method === "PUT";
+    const isWrite =
+      method === "POST" || method === "PUT" || method === "DELETE";
 
     const headers: Record<string, string> = {
       ...this.authHeaders(),
@@ -504,7 +490,6 @@ export class ConfluenceClient {
     return out;
   }
 
-  // Confluence returns _links.webui like "/spaces/KEY/pages/123/Title"
   toWebUrl(webuiPath: string): string {
     const base = this.cfg.baseUrl.replace(/\/+$/, "");
     if (webuiPath.startsWith("http")) return webuiPath;

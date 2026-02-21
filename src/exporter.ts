@@ -11,6 +11,7 @@ import type { MappingService } from "./mapping";
 import { SnapshotService } from "./snapshots";
 import { normaliseStorage } from "./storageNormalise";
 import { buildHierarchy } from "./hierarchy";
+import type { ExportPlanItem } from "./exportPlan";
 
 export type ProgressFn = (text: string) => void;
 
@@ -22,6 +23,9 @@ export type HierarchyRunOptions = {
 export class Exporter {
   private converter = new ConfluenceStorageConverter();
   private snapshots: SnapshotService;
+
+  // Path -> whether we should apply label changes for this file during this export
+  private applyLabelsByPath: Map<string, boolean> | null = null;
 
   constructor(
     private app: App,
@@ -36,12 +40,6 @@ export class Exporter {
   // -----------------------------------------
   // Publish markdown pipeline
   // -----------------------------------------
-  /**
-   * Returns markdown that is safe/clean to publish:
-   * - removes YAML frontmatter block
-   * - strips inline Obsidian tags (#foo, #foo/bar) from body text
-   * - DOES NOT touch fenced code blocks / inline code
-   */
   private toPublishMarkdown(markdown: string): string {
     if (!markdown) return "";
 
@@ -63,8 +61,7 @@ export class Exporter {
       return `@@HOLE_${holes.length - 1}@@`;
     });
 
-    // 3) Strip inline tags (avoid headings by requiring whitespace or '(' before '#')
-    // Keep group 1 to avoid gluing words.
+    // 3) Strip inline tags
     s = s.replace(/(^|[\s(])#([A-Za-z0-9/_-]+)\b/gm, "$1");
 
     // 4) Restore holes
@@ -73,7 +70,7 @@ export class Exporter {
       return Number.isFinite(i) ? (holes[i] ?? "") : "";
     });
 
-    // 5) Normalise line endings & trim trailing whitespace
+    // 5) Normalise
     s = s
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n")
@@ -89,7 +86,7 @@ export class Exporter {
   // Public API
   // -----------------------------------------
   async exportFromRoot(root: TFile): Promise<void> {
-    return this.exportInternal(root, undefined, undefined);
+    return this.exportInternal(root, undefined, undefined, null);
   }
 
   public async collectExportSet(
@@ -103,12 +100,27 @@ export class Exporter {
     return ordered;
   }
 
+  /**
+   * Backwards-compatible:
+   * - pass Set<string> like before
+   * - OR pass ExportPlanItem[] (so we can read per-item applyLabelChanges)
+   */
   public async exportFromRootSelected(
     root: TFile,
-    selectedPaths: Set<string>,
+    selected: Set<string> | ExportPlanItem[],
     opts?: HierarchyRunOptions,
   ): Promise<void> {
-    return this.exportInternal(root, selectedPaths, opts);
+    if (Array.isArray(selected)) {
+      const selectedPaths = new Set(selected.map((i) => i.filePath));
+      const applyLabelsByPath = new Map<string, boolean>();
+      for (const i of selected) {
+        applyLabelsByPath.set(i.filePath, i.applyLabelChanges !== false);
+      }
+      return this.exportInternal(root, selectedPaths, opts, applyLabelsByPath);
+    }
+
+    // old usage: just a Set of paths
+    return this.exportInternal(root, selected, opts, null);
   }
 
   // -----------------------------------------
@@ -118,17 +130,18 @@ export class Exporter {
     root: TFile,
     selectedPaths?: Set<string>,
     opts?: HierarchyRunOptions,
+    applyLabelsByPath?: Map<string, boolean> | null,
   ): Promise<void> {
     await this.mapping.load();
+
+    // make available to syncLabelsForPage / ensurePageForFile / pass2
+    this.applyLabelsByPath = applyLabelsByPath ?? null;
 
     const files = await this.buildExportSet(root);
     const filtered = selectedPaths
       ? files.filter((f) => selectedPaths.has(f.path))
       : files;
 
-    // If the user deselects the root, we still need a sensible root for hierarchy.
-    // Best behavior: if root is not included, we treat the provided `root` as
-    // the conceptual root but only export the selected subset.
     const inSet = this.ensureRootPresent(root, filtered);
 
     const { ordered, parentByPath } = this.computeHierarchyAndOrder(
@@ -157,7 +170,7 @@ export class Exporter {
     const rootParent = this.settings.parentPageId || undefined;
 
     // -----------------------------
-    // Pass 1: ensure pages exist (in hierarchy-safe order)
+    // Pass 1: ensure pages exist
     // -----------------------------
     let idx = 0;
     for (const f of ordered) {
@@ -167,9 +180,6 @@ export class Exporter {
       );
 
       const isRoot = f.path === root.path;
-
-      // Compute desired parent pageId for this file.
-      // We decide in terms of file parent path, then map to Confluence pageId (from mapping).
       let parentIdOverride: string | undefined;
 
       if (isRoot) {
@@ -177,8 +187,6 @@ export class Exporter {
       } else {
         const parentPath = parentByPath.get(f.path) ?? root.path;
 
-        // FLAT mode legacy behavior: either under root page or under settings parent
-        // (This keeps your existing semantics when hierarchyMode is "flat".)
         if (this.getHierarchyMode(opts) === "flat") {
           const rootEntry = this.mapping.get(root.path);
           const rootPageId = rootEntry?.pageId;
@@ -208,7 +216,7 @@ export class Exporter {
     }
 
     // -----------------------------
-    // Pass 2: update storage content now that mappings exist for link resolution
+    // Pass 2: update storage content now that mappings exist
     // -----------------------------
     let j = 0;
     for (const f of ordered) {
@@ -223,6 +231,12 @@ export class Exporter {
     this.progress("Confluence: export complete");
     if (this.settings.showProgressNotices)
       new Notice("Confluence export complete.");
+  }
+
+  private shouldApplyLabels(filePath: string): boolean {
+    if (!this.applyLabelsByPath) return true; // default: apply labels
+    const v = this.applyLabelsByPath.get(filePath);
+    return v !== false;
   }
 
   // -----------------------------------------
@@ -319,10 +333,7 @@ export class Exporter {
   ): Promise<void> {
     const title = file.basename;
 
-    // Read original markdown (for tag extraction + embeds)
     const mdOriginal = await this.app.vault.read(file);
-
-    // Clean markdown for publishing (removes inline #tags + frontmatter)
     const mdPublish = this.toPublishMarkdown(mdOriginal);
 
     const storageRaw = this.converter.convert(mdPublish, this.makeCtx(file));
@@ -391,40 +402,27 @@ export class Exporter {
       updatedAt: new Date().toISOString(),
     });
 
-    // Snapshots (markdown snapshot stores "published markdown" sent to Confluence)
+    // Snapshots
     if (!this.settings.dryRun) {
       try {
         await this.snapshots.writeSnapshot(file.path, mdPublish);
-      } catch (e: any) {
-        console.warn(
-          `[Confluence] Snapshot write failed for ${file.path} (continuing):`,
-          e,
-        );
-      }
-
+      } catch {}
       try {
         await this.snapshots.writeStorageSnapshot(file.path, storageNorm);
+      } catch {}
+    }
+
+    // Labels (respect per-item toggle)
+    if (this.shouldApplyLabels(file.path)) {
+      try {
+        await this.syncLabelsForPage(pageId, mdOriginal);
       } catch (e: any) {
-        console.warn(
-          `[Confluence] Storage snapshot write failed for ${file.path} (continuing):`,
-          e,
-        );
+        console.warn("Label sync failed (continuing):", e);
+        new Notice(`Label sync failed for "${title}": ${e?.message ?? e}`);
       }
     }
 
-    // Labels from ORIGINAL markdown (so inline tags/frontmatter still become labels)
-    try {
-      const { extractObsidianTags, toConfluenceLabel } = await import("./tags");
-      const tags = extractObsidianTags(mdOriginal)
-        .map(toConfluenceLabel)
-        .filter(Boolean);
-      await this.client.addLabels(pageId, tags);
-    } catch (e: any) {
-      console.warn("Label sync failed (continuing):", e);
-      new Notice(`Label sync failed for "${title}": ${e?.message ?? e}`);
-    }
-
-    // Upload embeds (use original markdown so we see the embeds)
+    // Upload embeds
     try {
       await this.uploadEmbedsForPage(file, pageId);
     } catch (e: any) {
@@ -457,7 +455,7 @@ export class Exporter {
     const newStorageRaw = this.converter.convert(mdPublish, this.makeCtx(file));
     const newStorageNorm = normaliseStorage(newStorageRaw);
 
-    // Fetch current Confluence page (storage + title)
+    // Fetch current Confluence page
     let existingTitle = "";
     let existingStorageRaw = "";
     try {
@@ -467,9 +465,6 @@ export class Exporter {
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (msg.includes(" 404")) {
-        console.warn(
-          `[Confluence] Page missing during pass2 (mapping stale). Removing mapping: ${entry.pageId} for ${file.path}`,
-        );
         this.mapping.remove(file.path);
         return;
       }
@@ -491,26 +486,25 @@ export class Exporter {
     const titleUnchanged = (existingTitle || "").trim() === desiredTitle.trim();
 
     if (bodyUnchanged && titleUnchanged) {
-      console.log(`[Confluence] Skipping update (no changes): ${file.path}`);
+      // Still sync labels so tag-only changes apply (respect per-item toggle)
+      if (this.shouldApplyLabels(file.path)) {
+        try {
+          await this.syncLabelsForPage(entry.pageId, mdOriginal);
+        } catch (e: any) {
+          console.warn("Label sync failed (continuing):", e);
+          new Notice(
+            `Label sync failed for "${desiredTitle}": ${e?.message ?? e}`,
+          );
+        }
+      }
 
-      // Still refresh snapshots so plan diffs stay correct
+      // refresh snapshots so plan stays stable
       try {
         await this.snapshots.writeSnapshot(file.path, mdPublish);
-      } catch (e: any) {
-        console.warn(
-          `[Confluence] Snapshot write failed for ${file.path} (continuing):`,
-          e,
-        );
-      }
-
+      } catch {}
       try {
         await this.snapshots.writeStorageSnapshot(file.path, newStorageNorm);
-      } catch (e: any) {
-        console.warn(
-          `[Confluence] Storage snapshot write failed for ${file.path} (continuing):`,
-          e,
-        );
-      }
+      } catch {}
 
       return;
     }
@@ -518,29 +512,27 @@ export class Exporter {
     try {
       await this.client.updatePage(entry.pageId, desiredTitle, newStorageRaw);
 
-      try {
-        await this.snapshots.writeSnapshot(file.path, mdPublish);
-      } catch (e: any) {
-        console.warn(
-          `[Confluence] Snapshot write failed for ${file.path} (continuing):`,
-          e,
-        );
+      // After update, sync labels if enabled for this item
+      if (this.shouldApplyLabels(file.path)) {
+        try {
+          await this.syncLabelsForPage(entry.pageId, mdOriginal);
+        } catch (e: any) {
+          console.warn("Label sync failed (continuing):", e);
+          new Notice(
+            `Label sync failed for "${desiredTitle}": ${e?.message ?? e}`,
+          );
+        }
       }
 
       try {
+        await this.snapshots.writeSnapshot(file.path, mdPublish);
+      } catch {}
+      try {
         await this.snapshots.writeStorageSnapshot(file.path, newStorageNorm);
-      } catch (e: any) {
-        console.warn(
-          `[Confluence] Storage snapshot write failed for ${file.path} (continuing):`,
-          e,
-        );
-      }
+      } catch {}
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (msg.includes(" 404")) {
-        console.warn(
-          `[Confluence] Page missing during pass2 update (skipping): ${entry.pageId} for ${file.path}`,
-        );
         this.mapping.remove(file.path);
         return;
       }
@@ -608,9 +600,6 @@ export class Exporter {
     const hier = buildHierarchy(this.app, root, files, mode, policy);
     const parentByPath = hier.parentPathByPath;
 
-    // Deterministic ordering:
-    // - Topologically by parent/child
-    // - Stable sorting by path within a parent
     const ordered = this.orderByParentMap(root, files, parentByPath);
 
     return { ordered, parentByPath };
@@ -624,18 +613,16 @@ export class Exporter {
     const fileByPath = new Map<string, TFile>();
     for (const f of files) fileByPath.set(f.path, f);
 
-    // children[parent] = [child...]
     const children = new Map<string, string[]>();
     for (const f of files) {
       const child = f.path;
       const parent = parentByPath.get(child);
 
-      if (parent == null) continue; // top-level (root)
+      if (parent == null) continue;
       if (!children.has(parent)) children.set(parent, []);
       children.get(parent)!.push(child);
     }
 
-    // sort children lists for determinism
     for (const arr of children.values()) arr.sort((a, b) => a.localeCompare(b));
 
     const out: TFile[] = [];
@@ -652,10 +639,8 @@ export class Exporter {
       for (const k of kids) walk(k);
     };
 
-    // Always start with root if present
     if (fileByPath.has(root.path)) walk(root.path);
 
-    // Then any disconnected nodes (shouldn’t happen often, but safe)
     const remaining = Array.from(fileByPath.keys()).filter(
       (p) => !visited.has(p),
     );
@@ -663,6 +648,43 @@ export class Exporter {
     for (const p of remaining) walk(p);
 
     return out;
+  }
+
+  private async syncLabelsForPage(
+    pageId: string,
+    mdOriginal: string,
+  ): Promise<void> {
+    const { extractObsidianTags, toConfluenceLabel } = await import("./tags");
+
+    let desired = extractObsidianTags(mdOriginal)
+      .map(toConfluenceLabel)
+      .filter(Boolean);
+
+    if (!this.settings.includeInlineTagsForLabels) {
+      const mdNoInline = mdOriginal.replace(
+        /(^|[\s(])#([A-Za-z0-9/_-]+)\b/gm,
+        "$1",
+      );
+      desired = extractObsidianTags(mdNoInline)
+        .map(toConfluenceLabel)
+        .filter(Boolean);
+    }
+
+    desired = Array.from(new Set(desired));
+
+    const existing = Array.from(new Set(await this.client.getLabels(pageId)));
+
+    const existingSet = new Set(existing);
+    const desiredSet = new Set(desired);
+
+    const toAdd = desired.filter((x) => !existingSet.has(x));
+    const toRemove = existing.filter((x) => !desiredSet.has(x));
+
+    if (toAdd.length > 0) await this.client.addLabels(pageId, toAdd);
+
+    if (this.settings.labelSyncMode === "strict" && toRemove.length > 0) {
+      await this.client.removeLabels(pageId, toRemove);
+    }
   }
 
   private ensureRootPresent(root: TFile, files: TFile[]): TFile[] {

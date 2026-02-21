@@ -27,6 +27,14 @@ export interface ExportPlanItem {
 
   conflictPageId?: string;
   conflictWebui?: string;
+
+  labelsDesired?: string[];
+  labelsExisting?: string[];
+  labelsToAdd?: string[];
+  labelsToRemove?: string[];
+  labelsChanged?: boolean;
+
+  applyLabelChanges?: boolean;
 }
 
 export function effectiveAction(i: ExportPlanItem): PlanAction {

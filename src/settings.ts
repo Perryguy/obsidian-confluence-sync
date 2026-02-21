@@ -36,6 +36,10 @@ export const DEFAULT_SETTINGS: ConfluenceSettings = {
   hierarchyMode: "flat",
   hierarchyManyToManyPolicy: "closestToRoot",
   movePagesToMatchHierarchy: false,
+
+  // ✅ Label behaviour (NEW)
+  labelSyncMode: "addOnly", // safe default
+  includeInlineTagsForLabels: true,
 };
 
 export class ConfluenceSettingTab extends PluginSettingTab {
@@ -158,18 +162,6 @@ export class ConfluenceSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Parent Page ID (optional)")
-      .setDesc("If set, exported pages are created beneath this page.")
-      .addText((t: any) =>
-        t
-          .setValue(this.plugin.settings.parentPageId ?? "")
-          .onChange(async (v: string) => {
-            this.plugin.settings.parentPageId = v.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
     new Setting(containerEl).setName("Export Mode").addDropdown((d: any) =>
       d
         .addOption("backlinks", "Backlinks (notes linking to current)")
@@ -243,6 +235,44 @@ export class ConfluenceSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.showProgressNotices)
           .onChange(async (v: boolean) => {
             this.plugin.settings.showProgressNotices = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    // ---------------------------
+    // ✅ Labels settings (NEW)
+    // ---------------------------
+    containerEl.createEl("hr");
+    containerEl.createEl("h3", {
+      text: "Labels (Obsidian tags → Confluence labels)",
+    });
+
+    new Setting(containerEl)
+      .setName("Include inline #tags")
+      .setDesc(
+        "If enabled, inline hashtags in the note body become Confluence labels. Frontmatter tags always apply.",
+      )
+      .addToggle((t: any) =>
+        t
+          .setValue(this.plugin.settings.includeInlineTagsForLabels ?? true)
+          .onChange(async (v: boolean) => {
+            this.plugin.settings.includeInlineTagsForLabels = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Label sync mode")
+      .setDesc(
+        "Add-only is safe. Strict will REMOVE labels on Confluence that are not present in Obsidian tags.",
+      )
+      .addDropdown((d: any) =>
+        d
+          .addOption("addOnly", "Add-only (safe)")
+          .addOption("strict", "Strict (remove extras)")
+          .setValue(this.plugin.settings.labelSyncMode ?? "addOnly")
+          .onChange(async (v: string) => {
+            this.plugin.settings.labelSyncMode = v as any;
             await this.plugin.saveSettings();
           }),
       );
