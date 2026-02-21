@@ -38,6 +38,27 @@ function extractPageIdFromInput(raw: string): string | undefined {
   return undefined;
 }
 
+function fmtLabelDelta(add?: string[], remove?: string[]): string {
+  const a = add?.length ?? 0;
+  const r = remove?.length ?? 0;
+  if (a === 0 && r === 0) return "Labels unchanged";
+  if (a > 0 && r > 0) return `Labels changed (+${a} / -${r})`;
+  if (a > 0) return `Labels changed (+${a})`;
+  return `Labels changed (-${r})`;
+}
+
+function labelsOnlyUpdateHeuristic(item: ExportPlanItem): boolean {
+  // We don’t have a first-class "contentChanged" flag in the item shape,
+  // so we use the planBuilder reason text as the indicator.
+  // Your planBuilder sets: "Labels changed (tag-only change)."
+  const reason = (item.reason ?? "").toLowerCase();
+  return (
+    !!item.labelsChanged &&
+    reason.includes("labels changed") &&
+    item.titleChanged !== true
+  );
+}
+
 export class ExportPlanModal extends Modal {
   private items: ExportPlanItem[];
   private hierarchyPreviewLines: string[] = [];
@@ -259,6 +280,61 @@ export class ExportPlanModal extends Modal {
         a.rel = "noopener";
       }
 
+      // ---- Labels UI (NEW) ----
+      const labelsChanged = !!item.labelsChanged;
+      const add = item.labelsToAdd ?? [];
+      const remove = item.labelsToRemove ?? [];
+
+      // Show a compact line only when we have label info (or label changes)
+      if (labelsChanged || (item.labelsDesired?.length ?? 0) > 0) {
+        details.createEl("div", {
+          text: fmtLabelDelta(add, remove),
+          cls: labelsChanged ? "confluence-muted" : "confluence-muted",
+        });
+
+        // Toggle: Apply label changes
+        // Default ON unless explicitly set false
+        if (item.applyLabelChanges === undefined) item.applyLabelChanges = true;
+
+        const isLabelsOnly = labelsOnlyUpdateHeuristic(item);
+
+        new Setting(details)
+          .setName("Apply label changes")
+          .setDesc(
+            isLabelsOnly
+              ? "If off, this becomes a skip (labels-only update)."
+              : "If off, page content/title may still update but labels won't change.",
+          )
+          .addToggle((t) => {
+            t.setValue(item.applyLabelChanges !== false);
+            t.onChange((v) => {
+              item.applyLabelChanges = v;
+
+              // If this item is an update ONLY because of labels, allow the toggle to convert it to skip.
+              if (!v && isLabelsOnly && item.action === "update") {
+                item.overrideAction = "skip";
+                item.selected = false;
+              } else if (v && item.overrideAction === "skip" && isLabelsOnly) {
+                // Restore default planned action
+                item.overrideAction = undefined;
+                item.selected = true;
+              }
+
+              this.render();
+            });
+          });
+
+        // Show detailed add/remove lists if they exist
+        if (add.length > 0) {
+          const d = details.createDiv({ cls: "confluence-muted" });
+          d.createEl("div", { text: `Add labels: ${add.join(", ")}` });
+        }
+        if (remove.length > 0) {
+          const d = details.createDiv({ cls: "confluence-muted" });
+          d.createEl("div", { text: `Remove labels: ${remove.join(", ")}` });
+        }
+      }
+
       if ((eff === "update" || eff === "recreate") && item.hasDiff) {
         const diffBtn = details.createEl("button", { text: "Diff" });
         diffBtn.onclick = async () => {
@@ -331,7 +407,7 @@ export class ExportPlanModal extends Modal {
         .filter((i) => i.selected)
         .map((i) => {
           i.action = effectiveAction(i);
-          i.overrideAction = undefined;
+          // Leave overrideAction in place (it matters: skip vs update)
           return i;
         })
         .filter((i) => i.action !== "skip" && i.action !== "conflict");
