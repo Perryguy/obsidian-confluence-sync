@@ -73,45 +73,280 @@ The plugin builds a deterministic export set.
 
 ------------------------------------------------------------------------
 
-### 2️⃣ Hierarchy Resolution (Optional)
+# Hierarchy Resolution (Optional)
 
 If hierarchy mode is enabled, the plugin determines parent-child
-relationships **within the export set**.
+relationships **within the export set** before publishing to Confluence.
 
-#### Flat
+Hierarchy only applies to notes included in the current export set.\
+Notes outside the set are ignored when computing structure.
 
-Everything (except root) is created under: - The configured parent page,
-or - The exported root page
+The computed hierarchy is previewed in the Review modal before export.
 
-#### Links
+------------------------------------------------------------------------
 
-If Note A links to Note B and both are exported: - B may become a child
-of A (depending on strategy)
+## Flat
 
-#### Folder
+All exported notes (except the root note) are created under:
 
-Uses folder structure: - `folder/index.md` or `folder/folder.md` can
-become parent
+-   The configured parent page (if set), or
+-   The exported root page
 
-#### Frontmatter
+Example export set:
+
+    Index
+    Page A
+    Page B
+    Page C
+
+Result:
+
+    Index
+    ├─ Page A
+    ├─ Page B
+    └─ Page C
+
+------------------------------------------------------------------------
+
+## Links-Based Hierarchy
+
+Parent-child relationships are inferred from note links.
+
+If Note A links to Note B and both are exported,\
+B may become a child of A.
+
+Example:
+
+**Index.md**
+
+    - [[Page A]]
+    - [[Page B]]
+
+**Page B.md**
+
+    See also [[Page C]]
+
+Export set:
+
+    Index
+    Page A
+    Page B
+    Page C
+
+Result:
+
+    Index
+    ├─ Page A
+    └─ Page B
+       └─ Page C
+
+Only links between exported notes are considered.
+
+------------------------------------------------------------------------
+
+## Folder-Based Hierarchy
+
+Uses folder structure to infer parent relationships.
+
+The plugin searches upward for:
+
+-   `folder/index.md`
+-   `folder/folder.md`
+
+Example vault:
+
+    Docs/
+    ├─ index.md
+    ├─ Guide/
+    │  ├─ Guide.md
+    │  ├─ Install.md
+    │  └─ Config.md
+    └─ FAQ.md
+
+Export set:
+
+    Docs/index
+    Docs/Guide/Guide
+    Docs/Guide/Install
+    Docs/Guide/Config
+    Docs/FAQ
+
+Result:
+
+    Docs
+    ├─ Guide
+    │  ├─ Install
+    │  └─ Config
+    └─ FAQ
+
+If no folder parent is found, the note falls back to the root.
+
+------------------------------------------------------------------------
+
+## Frontmatter-Based Hierarchy
+
+A note can explicitly declare its parent:
 
 ``` yaml
 parent: Some Note
 ```
 
-#### Hybrid
+Example:
 
-Combines folder + link strategies.
+**Page A.md**
 
-#### Many-to-many Handling
+``` yaml
+parent: Index
+```
 
-If multiple possible parents exist:
+**Page B.md**
 
-Policies: - `firstSeen` - `closestToRoot` - `preferFolderIndex`
+``` yaml
+parent: Page A
+```
 
-Cycles are automatically broken safely.
+Export set:
 
-Hierarchy is previewed in the review modal before export.
+    Index
+    Page A
+    Page B
+
+Result:
+
+    Index
+    └─ Page A
+       └─ Page B
+
+If the declared parent is not part of the export set,\
+the note falls back to the root.
+
+------------------------------------------------------------------------
+
+## Hybrid Mode
+
+Combines multiple strategies.
+
+Typical order:
+
+1.  Folder-based parent
+2.  Link-based parent
+3.  Fallback to root
+
+Example:
+
+    Docs/
+    ├─ index.md
+    ├─ Guide/
+    │  ├─ Guide.md
+    │  └─ Install.md
+
+If:
+
+-   `Install.md` links to `Guide.md`
+-   `Guide.md` is folder parent
+
+Hybrid will prefer the folder parent first.
+
+Result:
+
+    Docs
+    └─ Guide
+       └─ Install
+
+------------------------------------------------------------------------
+
+# Many-to-Many Handling
+
+Sometimes multiple valid parents exist.
+
+Example:
+
+**Index.md**
+
+    [[Page A]]
+    [[Page B]]
+
+**Page A.md**
+
+    [[Page C]]
+
+**Page B.md**
+
+    [[Page C]]
+
+Export set:
+
+    Index
+    Page A
+    Page B
+    Page C
+
+Both Page A and Page B link to Page C.
+
+The plugin applies a policy to choose one parent.
+
+------------------------------------------------------------------------
+
+## Policy: firstSeen
+
+The first valid parent encountered is used.
+
+    Index
+    ├─ Page A
+    │  └─ Page C
+    └─ Page B
+
+------------------------------------------------------------------------
+
+## Policy: closestToRoot
+
+The parent closest to the root note is preferred.
+
+Example:
+
+    Index
+    └─ Page A
+       └─ Page B
+          └─ Page C
+
+Page C attaches to Page B.
+
+------------------------------------------------------------------------
+
+## Policy: preferFolderIndex
+
+If a folder index parent exists, it is preferred over link-based
+parents.
+
+------------------------------------------------------------------------
+
+# Cycle Protection
+
+If a cycle is detected:
+
+    Page A → Page B
+    Page B → Page A
+
+The plugin automatically breaks the cycle safely by attaching one node
+to the root.
+
+Result:
+
+    Index
+    ├─ Page A
+    └─ Page B
+
+Cycles will never cause infinite nesting or export failure.
+
+------------------------------------------------------------------------
+
+# Important Notes
+
+-   Hierarchy only affects pages in the current export set.
+-   Pages are not duplicated.
+-   Only one parent is assigned per page.
+-   Page moves are not yet automatically detected.
+-   The final hierarchy is previewed in the Review modal before export.
 
 ------------------------------------------------------------------------
 
